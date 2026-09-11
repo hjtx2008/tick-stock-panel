@@ -1,0 +1,22 @@
+# Tushare Pro — 国内老牌金融数据开放社区 (https://tushare.pro)
+# 纯 HTTP REST 源, 无额外依赖 (runtime: none, 复用项目既有的 httpx)。
+#
+# 为什么必须做成插件而非"设置页新增自定义源":
+#   项目声明式 YAML 源 (GenericHTTPProvider) 要求 扁平 {symbols, start_time, end_time}
+#   参数 + bearer/header/query 鉴权 + response_path 指向对象数组; 而 Tushare 是
+#   单端点 POST {api_name, token, params:{...}} — token 在 body 内、参数嵌套、响应为
+#   {data:{fields:[...], items:[[...]]}} 列名与二维行分离。三者结构性不匹配。
+#   docs/plugin-development.md 的 runtime 典型场景已明确列出 tushare, 属官方预期路径。
+#
+# 需在设置页填写 Token 或配置环境变量 TUSHARE_API_KEY; 未配置时插件灰显不可切换。
+
+name: tushare
+display_name: "tushare"
+runtime: none
+entry: app.plugins.tushare.provider:TushareProvider
+check: app.plugins.tushare.provider:availability
+datasets: [daily, adj_factor]
+api_key_env: TUSHARE_API_KEY   # 声明后设置页提供 Token 输入框(先探后存, secrets.json 优先)
+description: "Tushare Pro 金融数据接口。日K(未复权原始价, 全市场同步按交易日循环取数, 单次返回全市场故比逐标的快三个数量级; 标的数较少时自动切回逐标的分页模式)、除权因子(官方累积因子序列 → 单事件 pre/post 比值, 与项目 pipeline 的 cum_prod 口径一致)。未声明 minute/realtime/financial → 自动回退现有数据源。"
+install_hint: "点击卡片中的输入框配置 Token(https://tushare.pro 个人中心获取),或在 .env 中配置 TUSHARE_API_KEY"
+homepage: "https://tushare.pro"
