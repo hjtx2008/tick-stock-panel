@@ -90,7 +90,10 @@ export const QK = {
   indexDaily:           (symbol: string, start: string, end: string) =>
                              ['index-daily', symbol, start, end] as const,
   indexMinute:          (symbol: string, date: string) =>
-                             ['index-minute', symbol, date] as const,
+                            ['index-minute', symbol, date] as const,
+  // 沪深两市日成交额趋势 (沪市=上证指数 / 深市=深证综指)
+  marketVolumeTrend:    (days: number) =>
+                            ['market-volume-trend', days] as const,
 
   // Schema
   extDataSchemaAll:     ['ext-data-schema-all'] as const,

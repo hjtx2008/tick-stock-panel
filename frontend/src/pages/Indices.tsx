@@ -7,6 +7,7 @@ import { QK } from '@/lib/queryKeys'
 import { useCapabilities } from '@/lib/useSharedQueries'
 import { EChartsCandlestick, type OHLC } from '@/components/EChartsCandlestick'
 import { EChartsIntraday } from '@/components/EChartsIntraday'
+import { MarketVolumeChart, MARKET_VOLUME, useMarketVolume, buildVolumePoints, fmtYi as fmtVolYi } from '@/components/MarketVolumeChart'
 
 function defaultRange() {
   const now = new Date()
@@ -80,6 +81,15 @@ export function Indices() {
   }))
 
   const selectedSymbol = selected || topRows[0]?.symbol || ''
+  // 「沪深成交量」为特殊视图项: 不对应单一指数, 选中时主图显示两市成交额大曲线
+  const isMarketVolume = selectedSymbol === MARKET_VOLUME
+  // 侧栏第五项的实时数值 (常驻轻量查询, 与主图大曲线共用缓存前缀)
+  const mvSummary = useMarketVolume({ days: 120 }, true)
+  const mvPoints = useMemo(
+    () => buildVolumePoints(mvSummary.data?.sh?.rows, mvSummary.data?.sz?.rows),
+    [mvSummary.data],
+  )
+  const mvLast = mvPoints[mvPoints.length - 1]
 
   useEffect(() => {
     if (symbolParam && symbolParam !== selected) setSelected(symbolParam)
@@ -99,14 +109,14 @@ export function Indices() {
   const daily = useQuery({
     queryKey: QK.indexDaily(selectedSymbol, range.start, range.end),
     queryFn: () => api.indexDaily(selectedSymbol, 180, range),
-    enabled: !!selectedSymbol,
+    enabled: !!selectedSymbol && !isMarketVolume,
     placeholderData: (prev) => prev,
   })
 
   const minute = useQuery({
     queryKey: QK.indexMinute(selectedSymbol, selectedDate ?? ''),
     queryFn: () => api.indexMinute(selectedSymbol, selectedDate ?? undefined),
-    enabled: !!selectedSymbol && !!selectedDate && hasMinuteCap,
+    enabled: !!selectedSymbol && !!selectedDate && hasMinuteCap && !isMarketVolume,
     placeholderData: (prev) => prev,
   })
 
@@ -196,6 +206,30 @@ export function Indices() {
           <div className="mb-2 px-1 text-[11px] uppercase tracking-wider text-muted">核心指数</div>
           <div className="space-y-1">
             {topRows.map(renderIndexItem)}
+            {/* 第五项: 沪深成交量 (特殊视图, 点击后主图显示两市成交额大曲线) */}
+            <button
+              onClick={() => selectIndex(MARKET_VOLUME)}
+              className={`w-full rounded-btn px-2 py-2 text-left transition-colors ${isMarketVolume ? 'bg-accent/15 text-foreground' : 'hover:bg-elevated text-secondary'}`}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="truncate text-xs font-medium">沪深成交量</span>
+                <span className="text-[10px] font-mono text-muted">亿元</span>
+              </div>
+              <div className="mt-0.5 flex items-center justify-between text-[10px] font-mono text-muted">
+                <span>
+                  <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full align-middle" style={{ background: '#F59E0B' }} />
+                  沪 {fmtVolYi(mvLast?.sh)}
+                </span>
+                <span>
+                  <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full align-middle" style={{ background: '#38BDF8' }} />
+                  深 {fmtVolYi(mvLast?.sz)}
+                </span>
+              </div>
+              <div className="mt-0.5 text-[10px] font-mono text-muted">
+                <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full align-middle" style={{ background: '#A78BFA' }} />
+                合计 {fmtVolYi(mvLast?.total)}
+              </div>
+            </button>
           </div>
         </aside>
 
@@ -205,14 +239,24 @@ export function Indices() {
               <div className="flex items-center gap-2">
                 <Activity className="h-4 w-4 text-accent" />
                 <h2 className="truncate text-sm font-semibold text-foreground">
-                  {selectedInfo?.name || selectedSymbol || '未选择指数'}
+                  {isMarketVolume
+                    ? '沪深成交量'
+                    : (selectedInfo?.name || selectedSymbol || '未选择指数')}
                 </h2>
-                {selectedSymbol && <span className="font-mono text-xs text-muted">{selectedSymbol}</span>}
-                {selectedSymbol && <span className="font-mono text-xs text-foreground">{fmtNum(selectedQuoteValue)}</span>}
-                {selectedSymbol && <span className={`font-mono text-xs ${Number(selectedQuotePct ?? 0) >= 0 ? 'text-bull' : 'text-bear'}`}>{fmtPct(selectedQuotePct)}</span>}
+                {isMarketVolume ? (
+                  <span className="font-mono text-xs text-muted">沪 000001.SH · 深 399106.SZ</span>
+                ) : (
+                  <>
+                    {selectedSymbol && <span className="font-mono text-xs text-muted">{selectedSymbol}</span>}
+                    {selectedSymbol && <span className="font-mono text-xs text-foreground">{fmtNum(selectedQuoteValue)}</span>}
+                    {selectedSymbol && <span className={`font-mono text-xs ${Number(selectedQuotePct ?? 0) >= 0 ? 'text-bull' : 'text-bear'}`}>{fmtPct(selectedQuotePct)}</span>}
+                  </>
+                )}
               </div>
               <div className="mt-1 text-xs text-muted">
-                实时缓存 {quotes.data?.count ?? 0} 只指数 · 日K来源 {daily.data?.source ?? '--'}
+                {isMarketVolume
+                  ? '沪市=上证指数成交额 / 深市=深证综指成交额, 单位亿元'
+                  : <>实时缓存 {quotes.data?.count ?? 0} 只指数 · 日K来源 {daily.data?.source ?? '--'}</>}
               </div>
             </div>
             <div className="flex items-center gap-2 text-xs">
@@ -232,14 +276,19 @@ export function Indices() {
             </div>
           </div>
 
-          {daily.isLoading && <div className="py-10 text-center text-sm text-muted">日K加载中…</div>}
-          {daily.isError && <div className="py-4 text-sm text-danger">指数日K加载失败</div>}
-          {!daily.isLoading && !daily.isError && chartRows.length === 0 && (
-            <div className="rounded-card bg-elevated p-6 text-center text-sm text-muted">
-              暂无日K数据。可以先同步指数日K，或选择其他指数。
-            </div>
-          )}
-          {chartRows.length > 0 && (
+          {isMarketVolume ? (
+            /* 沪深成交量视图: 主图显示两市成交额大曲线 (日期范围沿用顶部选择器) */
+            <MarketVolumeChart start={range.start} end={range.end} height={620} />
+          ) : (
+            <>
+              {daily.isLoading && <div className="py-10 text-center text-sm text-muted">日K加载中…</div>}
+              {daily.isError && <div className="py-4 text-sm text-danger">指数日K加载失败</div>}
+              {!daily.isLoading && !daily.isError && chartRows.length === 0 && (
+                <div className="rounded-card bg-elevated p-6 text-center text-sm text-muted">
+                  暂无日K数据。可以先同步指数日K，或选择其他指数。
+                </div>
+              )}
+              {chartRows.length > 0 && (
             <div className="flex items-start gap-3">
               <div className="min-w-0 flex-1">
                 <EChartsCandlestick
@@ -285,6 +334,8 @@ export function Indices() {
                 )}
               </div>
             </div>
+              )}
+            </>
           )}
         </main>
       </div>
