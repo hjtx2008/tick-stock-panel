@@ -1727,6 +1727,8 @@ export interface DataSourceTestResult {
   rows: number
   columns: string[]
   preview: Record<string, unknown>[]
+  /** 试拉失败时插件/源返回的说明 (不抛异常, rows=0)。 */
+  error?: string
 }
 
 /** 插件 Key 保存结果 (先探后存: 无效 Key 返回 ok=false 且不落盘) */

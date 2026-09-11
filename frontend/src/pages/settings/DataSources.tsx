@@ -17,6 +17,7 @@ import {
   ListChecks,
   Loader2,
   Lock,
+  Play,
   Plus,
   Puzzle,
   Radio,
@@ -999,6 +1000,81 @@ export function SettingsDataSourcesPanel({ highlight }: { highlight?: string } =
 }
 
 /** 插件详情: 介绍 + 适配能力 + Key 配置合并为单一卡片 */
+/** 插件试拉测试: 复用 /api/settings/data-sources/test (按 provider 名字取已注册实例)。
+ *
+ *  与自定义 YAML 源「测试连接」的区别: 插件的配置由 plugin.yaml 固定, 不允许也不需传 config,
+ *  所以只发 {provider, dataset, symbols} 三个字段, 后端 create_provider 分支不会走到。
+ *  注意后端 test_dataset 失败时是返回 {rows:0, error} 而非抛异常, 所以 error 字段要单独判。
+ */
+function PluginTestPull({ plugin }: { plugin: PluginDataSourceItem }) {
+  const testable = (plugin.datasets ?? []).filter(d => d in DATASET_LABEL)
+  const [dataset, setDataset] = useState(testable[0] ?? 'daily')
+  const [symbols, setSymbols] = useState('000001.SZ,600519.SH')
+  const test = useMutation({
+    mutationFn: () => api.testDataSource(
+      plugin.name,
+      dataset,
+      symbols.split(/[,\s]+/).map(s => s.trim()).filter(Boolean),
+    ),
+  })
+  if (testable.length === 0) return null
+
+  const result = test.data
+  const rows = result?.rows ?? 0
+  const failed = !!result?.error || (result != null && rows === 0)
+  return (
+    <div className="mt-4 pt-3 border-t border-border/30">
+      <div className="flex items-center gap-2 mb-2">
+        <Play className="h-3 w-3 text-muted" />
+        <span className="text-[11px] font-medium text-secondary">试拉测试</span>
+        <span className="text-[10px] text-muted/50">不写盘, 只验证连通性与字段</span>
+      </div>
+      <div className="flex items-center gap-2">
+        <select
+          value={dataset}
+          onChange={e => { setDataset(e.target.value); test.reset() }}
+          className="h-8 shrink-0 rounded-lg bg-base px-2 text-xs text-foreground ring-1 ring-border/40 focus:outline-none focus:ring-2 focus:ring-accent/40"
+        >
+          {testable.map(d => (
+            <option key={d} value={d}>{DATASET_LABEL[d] ?? d}</option>
+          ))}
+        </select>
+        <input
+          value={symbols}
+          onChange={e => setSymbols(e.target.value)}
+          placeholder="测试标的, 逗号分隔"
+          className="h-8 min-w-0 flex-1 rounded-lg bg-base px-2.5 text-xs font-mono text-foreground ring-1 ring-border/40 placeholder:text-muted/30 focus:outline-none focus:ring-2 focus:ring-accent/40"
+        />
+        <button
+          type="button"
+          onClick={() => test.mutate()}
+          disabled={test.isPending}
+          className="inline-flex shrink-0 items-center gap-1 rounded-btn bg-elevated px-3 py-1.5 text-xs text-secondary transition-colors hover:text-foreground disabled:opacity-40"
+        >
+          {test.isPending ? '测试中...' : '测试'}
+        </button>
+      </div>
+      {result && !failed && (
+        <div className="mt-2 rounded-lg border border-accent/20 bg-accent/5 px-3 py-2 text-xs">
+          <span className="font-medium text-accent">{rows}</span> 行
+          <span className="mx-1.5 text-muted">·</span>
+          列: <span className="text-secondary">{(result.columns ?? []).join(', ')}</span>
+        </div>
+      )}
+      {failed && (
+        <div className="mt-2 text-xs text-danger">
+          {result?.error || '未返回数据, 请检查 Token 权限与标的'}
+        </div>
+      )}
+      {test.isError && (
+        <div className="mt-2 text-xs text-danger">
+          {(test.error as Error | null)?.message || '试拉失败'}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function PluginDetail({ plugin, isActive, matrixCaps, servingSet }: {
   plugin: PluginDataSourceItem
   isActive: boolean
@@ -1051,6 +1127,9 @@ function PluginDetail({ plugin, isActive, matrixCaps, servingSet }: {
               <PluginKeyConfig plugin={plugin} />
             </div>
           )}
+
+          {/* 试拉测试: 仅在插件已注册(available)后可用, 未配置 Key 时后端拿不到 provider 实例 */}
+          {plugin.available && <PluginTestPull plugin={plugin} />}
         </div>
 
         {/* 能力适配表: 全部能力 × 该源适配状态 (样式对齐 TickFlow 能力档位表) */}
