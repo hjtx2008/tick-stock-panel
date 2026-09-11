@@ -99,8 +99,40 @@ def _industry_preset() -> ExtConfig:
     )
 
 
+
+def _capital_flow_preset() -> ExtConfig:
+    """全市场板块资金流向 (ext_capital_flow)。
+
+    看板「全市场资金流向」面板的数据源, 由用户在「设置 → 数据源」配置:
+      - 字段约定: industry (板块名) / flow_amount (资金净额, 亿) / direction (in|out|new) / date (YYYY-MM-DD)
+      - 拉取配置: 用户自行填 pull.url, 默认 enabled=False 不自动拉
+    本预设仅在用户尚未配置时自动创建 schema 占位, 不预填数据。
+    """
+    return ExtConfig(
+        id="ext_capital_flow",
+        label="全市场板块资金流向",
+        mode="timeseries",
+        fields=[
+            ExtField("date", "string", "日期"),
+            ExtField("industry", "string", "板块"),
+            ExtField("flow_amount", "float", "资金净额(亿)"),
+            ExtField("direction", "string", "方向"),
+        ],
+        description=(
+            "看板「全市场资金流向」面板的数据源。"
+            "在「设置 → 数据源」启用本表并填入字段/配置定时拉取后, 看板对应面板自动展示。"
+        ),
+        pull=PullConfig(
+            url="",
+            method="GET",
+            schedule_minutes=1440,
+            enabled=False,
+        ),
+    )
+
 def _presets() -> list[ExtConfig]:
-    return [_concept_preset(), _industry_preset()]
+    return [_concept_preset(), _industry_preset(), _capital_flow_preset()]
+
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +195,59 @@ def _flatten_industry_rows(raw_rows: list[dict]) -> list[dict]:
         })
     return out
 
+
+
+def _flatten_capital_flow_rows(
+    raw_rows: list[dict],
+    day: "date | None" = None,
+) -> list[dict]:
+    """全市场资金流向: 上游数组 → 本地 schema。
+
+    支持两种上游形态, 自动识别:
+      - 东方财富板块接口 [{f12, f14, f3, f62, f184, f204, f205}, ...]
+        f14=板块名, f62=主力净流入(元), f3=涨跌幅(%)
+        元 ÷ 1e8 自动换算为亿; direction 由 f62 符号推导
+      - 自定义数组 [{industry, flow_amount, direction, date}, ...]
+        direction 大小写不敏感, 'in'|'out'|'new'
+
+    date 字段优先用 day (后端按请求日期注入), 上游未给时回退 r.get('date')。
+    """
+    out: list[dict] = []
+    injected_date = day.isoformat() if day is not None else ""
+    for r in raw_rows:
+        # 东方财富原始字段 (f14=板块名, f62=主力净额元)
+        if "f14" in r or "f62" in r:
+            industry = (r.get("f14") or "").strip()
+            if not industry:
+                continue
+            try:
+                yuan = float(r.get("f62") or 0)
+            except (TypeError, ValueError):
+                yuan = 0.0
+            amount = round(yuan / 1e8, 4)
+            if yuan > 0:
+                direction = "in"
+            elif yuan < 0:
+                direction = "out"
+            else:
+                direction = "new"
+        else:
+            industry = (r.get("industry") or r.get("name") or "").strip()
+            if not industry:
+                continue
+            direction = str(r.get("direction") or "").strip().lower()
+            try:
+                amount = float(r.get("flow_amount") or r.get("amount") or 0)
+            except (TypeError, ValueError):
+                amount = 0.0
+        date_str = injected_date or str(r.get("date") or "").strip()
+        out.append({
+            "date": date_str,
+            "industry": industry,
+            "flow_amount": amount,
+            "direction": direction,
+        })
+    return out
 
 # ---------------------------------------------------------------------------
 # 拉取执行 (复用 httpx, 不依赖 fetch_and_ingest 的 PullConfig 路径)

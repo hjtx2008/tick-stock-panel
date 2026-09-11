@@ -617,11 +617,21 @@ def write_ext_parquet(
         out_path = cfg_dir / "part.parquet"
 
         # 如果已有文件，合并去重后覆盖
-        if out_path.exists():
+        if out_path.exists() and config.mode == "snapshot":
             try:
                 existing = pl.read_parquet(out_path)
-                key = "symbol" if "symbol" in df.columns else df.columns[0]
-                df = pl.concat([existing, df]).unique(subset=[key], keep="last")
+                # 去重 key 选择:
+                # - 有 symbol: 用 symbol (标的维度, 适合 ext_hy_ths/ext_gn_ths)
+                # - 无 symbol + snapshot: 用首列 (业务维度, 比如 ext_capital_flow 的 industry)
+                # - 无 symbol + timeseries: 按日分区已是天然去重, 不再 dedup (避免单一 date 列把当日多行合成 1 行)
+                if "symbol" in df.columns:
+                    merge_key = "symbol"
+                elif config.mode == "snapshot":
+                    merge_key = df.columns[0]
+                else:
+                    merge_key = None
+                if merge_key:
+                    df = pl.concat([existing, df]).unique(subset=[merge_key], keep="last")
             except Exception as e:
                 # schema 不一致 (列不同) 时 concat 失败 → 直接用新 df 覆盖。
                 # 记日志而非静默吞掉, 便于排查"数据结构错乱"类问题。
@@ -633,11 +643,21 @@ def write_ext_parquet(
         out_path = out_dir / "part.parquet"
 
         # 如果已有文件，合并去重
-        if out_path.exists():
+        if out_path.exists() and config.mode == "snapshot":
             try:
                 existing = pl.read_parquet(out_path)
-                key = "symbol" if "symbol" in df.columns else df.columns[0]
-                df = pl.concat([existing, df]).unique(subset=[key], keep="last")
+                # 去重 key 选择:
+                # - 有 symbol: 用 symbol (标的维度, 适合 ext_hy_ths/ext_gn_ths)
+                # - 无 symbol + snapshot: 用首列 (业务维度, 比如 ext_capital_flow 的 industry)
+                # - 无 symbol + timeseries: 按日分区已是天然去重, 不再 dedup (避免单一 date 列把当日多行合成 1 行)
+                if "symbol" in df.columns:
+                    merge_key = "symbol"
+                elif config.mode == "snapshot":
+                    merge_key = df.columns[0]
+                else:
+                    merge_key = None
+                if merge_key:
+                    df = pl.concat([existing, df]).unique(subset=[merge_key], keep="last")
             except Exception as e:
                 logger.warning("扩展表 %s 合并去重失败, 将覆盖写入: %s", config.id, e)
 

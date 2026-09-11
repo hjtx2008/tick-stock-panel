@@ -134,7 +134,7 @@ def get_minute_intraday_refresh_interval() -> int:
 # 监控中心个股通知 ext 字段默认配置 (与 ext_presets 内置预设对齐)
 _MONITOR_EXT_FIELDS_DEFAULT = {
     "concept": "ext_gn_ths.所属概念",
-    "industry": "ext_hy_ths.所属同话顺行业",
+    "industry": "ext_hy_ths.所属同花顺行业",
 }
 
 

@@ -26,8 +26,15 @@ export function priceColorClass(v: number | null | undefined): string {
   return v > 0 ? 'text-bull' : 'text-bear'
 }
 
-export function fmtBigNum(v: number | null | undefined): string {
+export function fmtBigNum(v: number | null | undefined, unit: 'yuan' | 'yi' = 'yuan'): string {
   if (v == null || Number.isNaN(v)) return '—'
+  // 资金流向类数据 (ext_capital_flow 等) 字段单位约定为「亿」,
+  // 输入值已是被除 1e8 后的「亿」数字; 直接显示, 避免按元误算
+  if (unit === 'yi') {
+    if (Math.abs(v) < 0.005) return '0'
+    return `${v.toFixed(2)}亿`
+  }
+  // 默认按元处理 (成交额等)
   if (v >= 1_000_000_000_000) return `${(v / 1_000_000_000_000).toFixed(2)}万亿`
   if (v >= 100_000_000) return `${(v / 100_000_000).toFixed(2)}亿`
   if (v >= 10_000) return `${(v / 10_000).toFixed(0)}万`

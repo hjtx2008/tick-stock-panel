@@ -111,16 +111,33 @@ def _apply_field_map(rows: list[dict], field_map: dict[str, str]) -> list[dict]:
 # 拉取执行
 # ---------------------------------------------------------------------------
 
-def _apply_preset_flatten(config_id: str, rows: list[dict]) -> list[dict]:
-    """对内置预设 (概念/行业) 应用结构转换, 与 fetch_preset 保持一致。
+def _apply_preset_flatten(
+    config_id: str,
+    rows: list[dict],
+    day: "date | None" = None,
+) -> list[dict]:
+    """对内置预设 (概念/行业/资金流向) 应用结构转换, 与 fetch_preset 保持一致。
 
     延迟导入避免与 ext_presets 形成循环依赖。
     非预设 id 原样返回。
+
+    ext_capital_flow 需要 day (用于 EM 接口元→亿换算后的 date 字段注入);
+    其它 preset 不消费 day 参数, 传入也无副作用。
     """
-    if config_id not in ("ext_gn_ths", "ext_hy_ths"):
+    if config_id not in ("ext_gn_ths", "ext_hy_ths", "ext_capital_flow"):
         return rows
-    from app.services.ext_presets import _flatten_concept_rows, _flatten_industry_rows
-    flatten = _flatten_concept_rows if config_id == "ext_gn_ths" else _flatten_industry_rows
+    from app.services.ext_presets import (
+        _flatten_concept_rows,
+        _flatten_industry_rows,
+        _flatten_capital_flow_rows,
+    )
+    if config_id == "ext_gn_ths":
+        flatten = _flatten_concept_rows
+    elif config_id == "ext_hy_ths":
+        flatten = _flatten_industry_rows
+    else:
+        from functools import partial
+        flatten = partial(_flatten_capital_flow_rows, day=day)
     return flatten(rows)
 
 
@@ -131,6 +148,30 @@ def _with_date_param(url: str, date_param: str | None, day: date) -> str:
     sep = "&" if "?" in url else "?"
     return f"{url}{sep}{date_param}={day.isoformat()}"
 
+
+def _assert_symbol_present_if_needed(rows: list[dict], config: ExtConfig) -> None:
+    """校验数据行是否含 symbol/code 或声明的映射源列。
+
+    仅当配置里声明了 mapped 类型的 symbol_map 或 code_map 时才校验,
+    避免 ext_capital_flow 等「按非标的维度聚合」的数据源 (按板块/概念/地域)
+    被误拒。ext_hy_ths / ext_gn_ths 仍按旧契约校验股票代码列存在。
+    """
+    if not rows:
+        return
+    mapped_declared = (
+        (config.symbol_map or {}).get("type") == "mapped"
+        or (config.code_map or {}).get("type") == "mapped"
+    )
+    if not mapped_declared:
+        return
+    row_keys = set(rows[0])
+    mapped_cols = {
+        m.get("col")
+        for m in (config.symbol_map or {}, config.code_map or {})
+        if isinstance(m, dict) and m.get("type") == "mapped" and m.get("col")
+    }
+    if not ({"symbol", "code"} & row_keys or mapped_cols & row_keys):
+        raise ValueError("数据行中缺少 symbol/code 字段，请配置字段映射或标的映射")
 
 def _apply_auth(config_id: str, auth: dict | None, url: str, headers: dict[str, str]) -> str:
     """把 secrets_store 里的 API Key 注入出站请求。
@@ -228,20 +269,15 @@ async def fetch_rows_for_date(config: ExtConfig, target_date: date) -> list[dict
     # 否则 raw 接口列 (concepts/industries 数组、name) 会直接覆盖正确的 part.parquet,
     # 导致分析页因找不到维度字段 (所属概念/所属同花顺行业) 而"数据消失"。
     # 见 ext_presets._flatten_* —— 手动拉取 / 定时拉取都必须走同一套转换。
-    rows = _apply_preset_flatten(config.id, rows)
+    rows = _apply_preset_flatten(config.id, rows, day=target_date)
 
     # 字段映射
     rows = _apply_field_map(rows, pull.field_map)
 
     # 校验可关联标的的字段：直接 symbol/code，或配置里声明的映射源列。
-    row_keys = set(rows[0]) if rows else set()
-    mapped_cols = {
-        m.get("col")
-        for m in (config.symbol_map or {}, config.code_map or {})
-        if m.get("type") == "mapped" and m.get("col")
-    }
-    if rows and not ({"symbol", "code"} & row_keys or mapped_cols & row_keys):
-        raise ValueError("数据行中缺少 symbol/code 字段，请配置字段映射或标的映射")
+    # 资金流向类 (按板块聚合) symbol_map/code_map 都为空, 跳过校验;
+    # 否则 ext_capital_flow 等「按非标的维度聚合」数据源会被误拒。
+    _assert_symbol_present_if_needed(rows, config)
 
     _assert_rows_date(rows, target_date)
     return rows
@@ -260,10 +296,58 @@ async def fetch_and_ingest(
     """
     day = target_date or date.today()
     rows = await fetch_rows_for_date(config, day)
+
+    # ext_capital_flow 特殊: EM sectorRank 单方向 (po=1=按 f62 降序)
+    # 只返回一侧 (全部 in 或全部 out), 翻转 po 追加反方向拉取,
+    # 让看板 inflow +outflow 同时显示 (否则 100 行全是 in 看不到流出曲线)
+    if config.id == "ext_capital_flow" and rows:
+        # EM sectorRank 单次只返 100 行且偏向一侧, 正常应拉两次 (po=1/ po=0) 凑满 ~200 行。
+        # 旧条件 len(directions)==1 太严: 只要结果里混入极少数反方向行 (如 94 in + 6 out)
+        # 就不再补拉, 导致只有 100 行、流出侧几乎为空 (09-11 流出合计仅 0.03亿)。
+        # 新条件: 行数不足 或 少数方向占比 < 25% 都判定为「单侧数据不完整」, 补拉反向。
+        dirs = [str(r.get("direction") or "").lower() for r in rows]
+        n_in = dirs.count("in")
+        n_out = dirs.count("out")
+        minority = min(n_in, n_out)
+        need_alt = len(rows) < 150 or (len(rows) > 0 and minority / len(rows) < 0.25)
+        if need_alt:
+            import copy
+            alt_url = _flip_em_po(config.pull.url)
+            if alt_url != config.pull.url:
+                alt_pull = copy.copy(config.pull)
+                alt_pull.url = alt_url
+                alt_config = copy.copy(config)
+                alt_config.pull = alt_pull
+                try:
+                    alt_rows = await fetch_rows_for_date(alt_config, day)
+                    # 两次拉取可能覆盖同一行业, 按 industry 去重 (保留主榜结果)
+                    seen = {str(r.get("industry") or "") for r in rows}
+                    added = [r for r in alt_rows if str(r.get("industry") or "") not in seen]
+                    rows = rows + added
+                    logger.info(
+                        "ext_capital_flow 反向拉取: 原始 %d 行, 去重后新增 %d 行 (主榜 in=%d out=%d)",
+                        len(alt_rows), len(added), n_in, n_out,
+                    )
+                except Exception as e:
+                    logger.warning("ext_capital_flow 反向拉取失败 (仍按单向写入): %s", e)
+
     if not rows:
         raise ValueError("提取到的行数为 0")
     n = rows_to_parquet(rows, config, data_dir, snapshot_date=day)
     return n, day.isoformat()
+
+
+def _flip_em_po(url: str) -> str:
+    """EM sectorRank URL po=1 <-> po=0 反向拉取 (供 ext_capital_flow 用)。
+
+    EM 接口按 fid 排序时只返回一侧 (po=1=降序 -> 正值在前, 全部 in;
+    po=0=升序 -> 负值在前, 全部 out)。翻转后可拿到互补的板块。
+    """
+    if "po=1" in url:
+        return url.replace("po=1", "po=0")
+    if "po=0" in url:
+        return url.replace("po=0", "po=1")
+    return url
 
 
 MAX_BACKFILL_DAYS = 120  # 单次回补上限: 同步端点, 控制请求时长

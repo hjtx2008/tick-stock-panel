@@ -47,7 +47,7 @@ export function ExtDataPullPanel({ config, onSaved }: {
   const [testing, setTesting] = useState(false)
   const [running, setRunning] = useState(false)
   const [runResult, setRunResult] = useState<{ rows: number; date: string } | null>(null)
-  const [testResult, setTestResult] = useState<{ total_rows: number; preview: Record<string, unknown>[]; has_symbol: boolean } | null>(null)
+  const [testResult, setTestResult] = useState<{ total_rows: number; preview: Record<string, unknown>[]; has_symbol: boolean; requires_symbol?: boolean } | null>(null)
   const [error, setError] = useState('')
 
   // 历史回补 (仅 timeseries + 接口支持按日查询)
@@ -514,7 +514,7 @@ export function ExtDataPullPanel({ config, onSaved }: {
             <span className="text-accent font-medium">测试成功</span>
             <span className="text-secondary">{testResult.total_rows} 行</span>
           </div>
-          {!testResult.has_symbol && (
+          {!testResult.has_symbol && testResult.requires_symbol && (
             <div className="text-[10px] text-amber-500">数据缺少 symbol 字段，请配置字段映射</div>
           )}
           {testResult.preview.length > 0 && (

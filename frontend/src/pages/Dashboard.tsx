@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, type ReactNode } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Activity, ArrowDownRight, ArrowUpRight, BarChart3, BellRing, Database, Flame, Gauge, Info, LineChart, Loader2, Play, RefreshCw, Sparkles, Target, Timer } from 'lucide-react'
+import { Activity, ArrowDownRight, ArrowUpRight, BarChart3, BellRing, Database, Flame, Gauge, Info, LineChart, Loader2, Play, RefreshCw, Sparkles, Target, Timer, Banknote } from 'lucide-react'
 import { DatePicker } from '@/components/DatePicker'
 import { api, type MarketSnapshotRow, type OverviewDimensionRankItem, type OverviewMarket, type AlertEvent } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
@@ -228,6 +228,367 @@ function MonitorWidget({ onStockClick, activeSymbol }: {
   )
 }
 
+// 全市场资金流向面板: 从 ext_capital_flow 数据源读取板块资金净流入/流出
+// 数据未配置时展示空态 (引导用户去设置 → 数据源 启用 ext_capital_flow)
+
+// 交易时段时间轴 (09:30-11:30 / 13:00-15:00): 显示当日交易进度与当前时间
+function TradingTimeBar() {
+  const [now, setNow] = useState(() => new Date())
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), 1000)
+    return () => clearInterval(t)
+  }, [])
+  const mins = now.getHours() * 60 + now.getMinutes()
+  const SESSIONS: [number, number][] = [[570, 690], [780, 900]]  // 09:30-11:30 / 13:00-15:00
+  const TOTAL_MIN = 240
+  const elapsed = SESSIONS.reduce((s, [a, b]) => s + Math.min(Math.max(mins - a, 0), b - a), 0)
+  const pct = Math.min(100, (elapsed / TOTAL_MIN) * 100)
+  const inSession = SESSIONS.some(([a, b]) => mins >= a && mins < b)
+  const hhmm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
+  const TICKS = ['09:30', '10:30', '11:30', '13:30', '15:00']
+  return (
+    <div className="flex items-center gap-2" title="交易时段 09:30-11:30 / 13:00-15:00 (午休不计入进度)">
+      <div className="min-w-0 flex-1">
+        <div className="relative h-1 overflow-visible rounded-full bg-elevated">
+          <div
+            className="h-1 rounded-full bg-gradient-to-r from-emerald-400/70 via-amber-400/70 to-rose-400/70 transition-[width] duration-1000"
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+        <div className="mt-0.5 flex justify-between font-mono text-[9px] text-muted">
+          {TICKS.map(t => <span key={t}>{t}</span>)}
+        </div>
+      </div>
+      <span className={cn('shrink-0 font-mono text-sm font-semibold tabular-nums', inSession ? 'text-emerald-400' : 'text-muted')}>
+        {hhmm}
+      </span>
+    </div>
+  )
+}
+
+function MarketCapitalFlowPanel() {
+  const flow = useQuery({
+    queryKey: QK.marketCapitalFlow("ext_capital_flow"),
+    queryFn: () => api.extDataRows("ext_capital_flow", { limit: 500 }),
+    staleTime: 60_000,
+    retry: false,
+  })
+  const rows = (flow.data?.rows ?? []) as Record<string, any>[]
+  const configured = !flow.isError && rows.length > 0
+  // 取 ext_capital_flow 最新日期的当日快照
+  const latestDate = rows.reduce<string | null>((acc, r) => {
+    const d = String(r.date ?? "")
+    return !acc || d > acc ? d : acc
+  }, null)
+  const todayRaw = latestDate ? rows.filter(r => String(r.date ?? "") === latestDate) : rows
+  // 行业层级去重: 数据源混用东财多个层级, 同一板块会以「XXⅡ」「XXⅢ」重复入库且金额完全相同
+  // (如 军工电子Ⅱ = 军工电子Ⅲ = 9.7761亿)。按「去罗马数字后缀的名称 + 金额」去重, 保留首条。
+  const today = (() => {
+    const seen = new Set<string>()
+    const out: Record<string, any>[] = []
+    for (const r of todayRaw) {
+      const base = String(r.industry ?? '').replace(/[ⅠⅡⅢⅣⅤ]+$/u, '').trim()
+      const amt = Math.round(Math.abs(Number(r.flow_amount ?? 0)) * 10000)
+      const key = `${base}|${amt}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push(r)
+    }
+    return out
+  })()
+  // top N 流出 / 流入 (按金额绝对值降序)
+  const TOP_N = 11
+  const outflow = today
+    .filter(r => String(r.direction ?? "").toLowerCase() === "out")
+    .sort((a, b) => Math.abs(Number(b.flow_amount ?? 0)) - Math.abs(Number(a.flow_amount ?? 0)))
+    .slice(0, TOP_N)
+  const inflow = today
+    .filter(r => String(r.direction ?? "").toLowerCase() === "in")
+    .sort((a, b) => Math.abs(Number(b.flow_amount ?? 0)) - Math.abs(Number(a.flow_amount ?? 0)))
+    .slice(0, TOP_N)
+  // 资金立场聚合 (单位: 亿) — 全市场口径: 累加当日全部行业, 而非仅 TOP_N
+  const sumAmt = (xs: Record<string, any>[]) =>
+    xs.reduce((s, r) => s + Math.abs(Number(r.flow_amount ?? 0)), 0)
+  const dirOf = (r: Record<string, any>) => String(r.direction ?? "").toLowerCase()
+  const totalIn = sumAmt(today.filter(r => dirOf(r) === "in"))    // 新资金进场 (总金额)
+  const totalOut = sumAmt(today.filter(r => dirOf(r) === "out"))  // 资金离场 (总金额)
+// Sankey 几何参数 — 全部在 SVG viewBox 内统一坐标系，彻底避免 HTML 覆盖层与 SVG 缩放错位
+  // 布局: [文字 180][间隙 8][条 8][间隙 14][曲线 364][间隙 14][条 8][间隙 8][文字 180]
+  // 实测容器宽度作为 viewBox 宽 → SVG 1:1 渲染, 字号/行高/行宽全部真实像素, 与其它板块一致
+  // 注意: ref div 在 configured 分支内, 数据加载后才挂载 — 必须用 callback ref + 依赖 wrapEl,
+  // 否则 useEffect 空依赖只在挂载时跑一次 (此刻 div 不存在), observer 永远挂不上, W 恒为 800
+  const [wrapEl, setWrapEl] = useState<HTMLDivElement | null>(null)
+  const [measuredW, setMeasuredW] = useState(0)
+  useEffect(() => {
+    if (!wrapEl) return
+    const ro = new ResizeObserver(entries => {
+      const w = entries[0]?.contentRect.width ?? 0
+      if (w > 0) setMeasuredW(Math.round(w))
+    })
+    ro.observe(wrapEl)
+    return () => ro.disconnect()
+  }, [wrapEl])
+
+  const W = measuredW || 800
+  const ROW_H = 40               // 每行固定高度 (主人指定, 真实像素)
+  const PAD_Y = 12
+  const H = Math.max(180, TOP_N * ROW_H + PAD_Y * 2)  // 高度 = 11×40+24 = 464px 真实像素
+  const PAD_X = 6
+  const COL_W = 8                // 板块条宽度
+  const GAP_TEXT_COL = 8         // 文字与条带间隙
+  const GAP_COL_CURVE = 10       // 条带与曲线间隙
+  const FONT_NAME = 11           // 行业名字号 (与「行业热度」一致)
+  const MIN_CURVE = 130          // 曲线通道最小宽度, 保证流动效果可见
+  // 文字区宽度按数据中最长行业名动态计算 (避免固定宽度导致两侧大片留白、中间通道被挤扁)
+  const FIXED_GAP = GAP_TEXT_COL + COL_W + GAP_COL_CURVE
+  const longestName = [...outflow, ...inflow].reduce(
+    (m, r) => Math.max(m, String(r.industry ?? '').length), 0,
+  )
+  const labelByText = longestName * FONT_NAME + 10
+  const labelBySpace = (W - PAD_X * 2 - MIN_CURVE - FIXED_GAP * 2) / 2
+  const LABEL_W = Math.max(64, Math.min(labelByText, labelBySpace, 176))
+  const LEFT_LABEL_END = PAD_X + LABEL_W
+  const LEFT_COL_X = LEFT_LABEL_END + GAP_TEXT_COL
+  const LEFT_COL_END = LEFT_COL_X + COL_W
+  const RIGHT_COL_END = W - PAD_X - LABEL_W - GAP_TEXT_COL
+  const RIGHT_COL_X = RIGHT_COL_END - COL_W
+  const usableH = H - PAD_Y * 2
+
+  const truncateLabel = (s: string, max = Math.max(4, Math.floor(LABEL_W / FONT_NAME))) => {
+    if (!s) return ''
+    return s.length <= max ? s : s.slice(0, max - 1) + '…'
+  }
+
+  // 板块块布局: 行高固定, 块高度在 50-100% slotH 之间随金额占比平滑过渡
+  const layoutBlocks = (list: typeof outflow, x: number) => {
+    if (list.length === 0) return []
+    const max = Math.max(...list.map(r => Math.abs(Number(r.flow_amount ?? 0))), 0.01)
+    const slotH = usableH / list.length
+    const gap = 4
+    return list.map((r, i) => {
+      const amt = Math.abs(Number(r.flow_amount ?? 0))
+      const ratio = amt / max
+      const h = Math.max(slotH * 0.5, slotH * (0.5 + 0.5 * ratio) - gap)
+      const y = PAD_Y + i * slotH + (slotH - h) / 2
+      return { r, x, y, w: COL_W, h, amt }
+    })
+  }
+  const leftBlocks = layoutBlocks(outflow, LEFT_COL_X)
+  const rightBlocks = layoutBlocks(inflow, RIGHT_COL_X)
+  // 连线: 每个板块保底连线, 而非全局取 top N
+  // 旧逻辑 weight = min(h_i, h_j)/maxCross 会退化成只由单个块高度决定 (因 h_max 恒 >= 其它块),
+  // 全局排序后连线全落在最大的一两个板块上, 其余板块一条线都分不到。
+  const maxCross = Math.max(
+    ...leftBlocks.map(b => b.h),
+    ...rightBlocks.map(b => b.h),
+    0.01,
+  )
+  const LINKS_PER_BLOCK = 2   // 每个板块最多连出的线数 (保证 22 个板块都参与流动)
+  const linkMap = new Map<string, { li: number; rj: number; weight: number }>()
+  const addLink = (li: number, rj: number) => {
+    const lb = leftBlocks[li]
+    const rb = rightBlocks[rj]
+    if (!lb || !rb) return
+    linkMap.set(`${li}-${rj}`, {
+      li, rj,
+      weight: Math.min(lb.h, rb.h) / maxCross,
+    })
+  }
+  // 每个流出板块 -> 权重最高的 N 个流入板块
+  for (let i = 0; i < leftBlocks.length; i++) {
+    rightBlocks
+      .map((rb, j) => ({ j, w: Math.min(leftBlocks[i].h, rb.h) }))
+      .sort((a, b) => b.w - a.w)
+      .slice(0, LINKS_PER_BLOCK)
+      .forEach(({ j }) => addLink(i, j))
+  }
+  // 每个流入板块 <- 权重最高的 N 个流出板块 (保证右侧小板块也有入线)
+  for (let j = 0; j < rightBlocks.length; j++) {
+    leftBlocks
+      .map((lb, i) => ({ i, w: Math.min(lb.h, rightBlocks[j].h) }))
+      .sort((a, b) => b.w - a.w)
+      .slice(0, LINKS_PER_BLOCK)
+      .forEach(({ i }) => addLink(i, j))
+  }
+  const links = [...linkMap.values()]
+
+  return (
+    <div>
+      <div className="mb-2 flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Banknote className="h-3.5 w-3.5 shrink-0 text-accent" />
+            <h2 className="text-xs font-semibold text-foreground">全市场资金流向追踪</h2>
+            {/* 数据时点 + 板块数: 单次拉取 100 行属不完整 (正常 ~200), 显式提示避免误读 */}
+            <span
+              className={`font-mono text-[10px] ${today.length < 150 ? 'text-amber-400' : 'text-muted'}`}
+              title={today.length < 150 ? '数据不完整: 单次拉取只返回 100 行, 需补拉反向' : undefined}
+            >
+              {latestDate ? latestDate.slice(5) : '—'} · {today.length}板块
+            </span>
+          </div>
+          <p className="mt-0.5 pl-5 text-[10px] text-muted">资金从哪来，到哪去</p>
+        </div>
+        <Link to="/data">
+          <ArrowUpRight className="h-3.5 w-3.5" />
+        </Link>
+      </div>
+      {configured ? (
+        <div className="space-y-1.5">
+          {/* 交易时段时间轴 (09:30-15:00) */}
+          <TradingTimeBar />
+          {/* 左右列标题 */}
+          <div className="flex items-center justify-between px-1 text-[10px] font-medium">
+            <span className="text-emerald-400">资金流出板块</span>
+            <span className="text-rose-400">资金流入方向</span>
+          </div>
+          {/* Sankey 桑基图: 左 11 出 -> 16 贝塞尔曲线 -> 右 11 入; 文字直接渲染在 SVG 内部 */}
+          <div
+            ref={setWrapEl}
+            title="中间连线为流向示意: 公开数据仅提供各板块净流入/流出金额, 无板块间真实资金流动矩阵"
+            className="rounded-card border border-border bg-surface/80 p-2 shadow-[0_1px_2px_rgba(0,0,0,0.04)]"
+          >
+            {measuredW === 0 ? (
+              // 测量完成前渲染同高占位, 避免布局跳动与 800 宽 viewBox 的错误缩放
+              <div style={{ height: H }} aria-hidden />
+            ) : (
+            <svg viewBox={`0 0 ${W} ${H}`} style={{ height: H }} className="block w-full">
+              <defs>
+                {/* userSpaceOnUse: 渐变按曲线通道起止绝对坐标计算, 水平曲线 (bbox 高度为 0) 也能正常渲染 */}
+                <linearGradient id="cap-flow-grad" gradientUnits="userSpaceOnUse" x1={LEFT_COL_END} y1="0" x2={RIGHT_COL_X} y2="0">
+                  <stop offset="0%" stopColor="rgb(52 211 153)" stopOpacity="0.75" />
+                  <stop offset="100%" stopColor="rgb(251 113 133)" stopOpacity="0.75" />
+                </linearGradient>
+              </defs>
+              {/* 曲线层: 贝塞尔 + stroke-dashoffset 流动动画 */}
+              {links.map(({ li, rj, weight }, idx) => {
+                const lb = leftBlocks[li]
+                const rb = rightBlocks[rj]
+                if (!lb || !rb) return null
+                const x1 = lb.x + lb.w
+                const y1 = lb.y + lb.h / 2
+                const x2 = rb.x
+                const y2 = rb.y + rb.h / 2
+                const xm = (x1 + x2) / 2
+                const stroke = Math.max(1.4, weight * 3.5)
+                return (
+                  <path
+                    key={`p-${idx}`}
+                    d={`M ${x1} ${y1} C ${xm} ${y1} ${xm} ${y2} ${x2} ${y2}`}
+                    stroke="url(#cap-flow-grad)"
+                    strokeWidth={stroke}
+                    fill="none"
+                    strokeDasharray="6 4"
+                    opacity={0.62}
+                  >
+                    <animate
+                      attributeName="stroke-dashoffset"
+                      from="0"
+                      to="-14"
+                      dur={`${1.6 + (idx % 5) * 0.15}s`}
+                      begin={`${((idx * 0.07) % 1.4).toFixed(3)}s`}
+                      repeatCount="indefinite"
+                    />
+                  </path>
+                )
+              })}
+              {/* 板块条层 */}
+              {leftBlocks.map((b, i) => (
+                <rect key={`lb-${i}`} x={b.x} y={b.y} width={b.w} height={b.h} fill="rgb(52 211 153)" opacity={0.9} rx="1.5" />
+              ))}
+              {rightBlocks.map((b, i) => (
+                <rect key={`rb-${i}`} x={b.x} y={b.y} width={b.w} height={b.h} fill="rgb(251 113 133)" opacity={0.9} rx="1.5" />
+              ))}
+              {/* 文字标签层 — 与条带/曲线共享同一 viewBox, 缩放永远对齐; 行距 18px */}
+              {leftBlocks.map((b, i) => {
+                const cy = b.y + b.h / 2
+                const industry = truncateLabel(String(b.r.industry ?? ''))
+                return (
+                  <g key={`lt-${i}`}>
+                    <text
+                      x={LEFT_LABEL_END}
+                      y={cy - 4}
+                      textAnchor="end"
+                      fill="currentColor"
+                      className="text-[11px] text-foreground/90"
+                    >
+                      {industry}
+                    </text>
+                    <text
+                      x={LEFT_LABEL_END}
+                      y={cy + 12}
+                      textAnchor="end"
+                      fill="currentColor"
+                      className="text-[10px] font-mono tabular-nums text-emerald-400"
+                    >
+                      -{fmtBigNum(b.amt, "yi")}
+                    </text>
+                  </g>
+                )
+              })}
+              {rightBlocks.map((b, i) => {
+                const cy = b.y + b.h / 2
+                const industry = truncateLabel(String(b.r.industry ?? ''))
+                return (
+                  <g key={`rt-${i}`}>
+                    <text
+                      x={RIGHT_COL_END + GAP_TEXT_COL}
+                      y={cy - 4}
+                      textAnchor="start"
+                      fill="currentColor"
+                      className="text-[11px] text-foreground/90"
+                    >
+                      {industry}
+                    </text>
+                    <text
+                      x={RIGHT_COL_END + GAP_TEXT_COL}
+                      y={cy + 12}
+                      textAnchor="start"
+                      fill="currentColor"
+                      className="text-[10px] font-mono tabular-nums text-rose-400"
+                    >
+                      +{fmtBigNum(b.amt, "yi")}
+                    </text>
+                  </g>
+                )
+              })}
+            </svg>
+            )}
+          </div>
+          {/* 底部资金立场 (全市场口径: 累加当日全部行业, 非仅 TOP_N) */}
+          <div className="grid grid-cols-2 gap-2 text-xs">
+            <div
+              title={`当日全部净流入板块金额合计 (共 ${today.filter(r => dirOf(r) === 'in').length} 个板块)`}
+              className="flex items-center justify-between gap-2 whitespace-nowrap rounded-md border border-amber-400/30 bg-amber-400/[0.06] px-2 py-1.5"
+            >
+              <span className="flex items-center gap-1 text-amber-400">
+                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" />新资金进场
+              </span>
+              <span className="font-mono tabular-nums text-amber-400 font-medium">{fmtBigNum(totalIn, "yi")}</span>
+            </div>
+            <div
+              title={`当日全部净流出板块金额合计 (共 ${today.filter(r => dirOf(r) === 'out').length} 个板块)`}
+              className="flex items-center justify-between gap-2 whitespace-nowrap rounded-md border border-emerald-400/30 bg-emerald-400/[0.06] px-2 py-1.5"
+            >
+              <span className="flex items-center gap-1 text-emerald-400">
+                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400" />资金离场
+              </span>
+              <span className="font-mono tabular-nums text-emerald-400 font-medium">{fmtBigNum(totalOut, "yi")}</span>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="rounded border border-dashed border-border py-4 text-center">
+          <div className="text-[11px] text-secondary">尚未配置 ext_capital_flow 数据源</div>
+          <Link to="/data">
+            前往设置 → 数据源
+            <ArrowUpRight className="h-3 w-3 self-center" />
+          </Link>
+        </div>
+      )}
+    </div>
+  )
+}
 function KpiCell({ label, value, sub, tone = 'neutral' }: { label: ReactNode; value: ReactNode; sub?: string; tone?: 'bull' | 'bear' | 'accent' | 'neutral' }) {
   const isPlain = typeof value === 'string' || typeof value === 'number'
   const color = tone === 'bull' ? 'text-bull' : tone === 'bear' ? 'text-bear' : tone === 'accent' ? 'text-accent' : 'text-foreground'
@@ -922,6 +1283,9 @@ export function Dashboard() {
               }}
             />
           </section>
+          <section className="rounded-card border border-border bg-surface/80 p-1.5 shadow-[0_1px_2px_hsl(var(--border)/0.4)] backdrop-blur-sm transition-shadow hover:shadow-[0_2px_8px_hsl(var(--border)/0.5)]">
+            <MarketCapitalFlowPanel />
+          </section>
         </aside>
       </div>
 
@@ -1101,3 +1465,5 @@ function WelcomeFetchModal({
     </SettingsModal>
   )
 }
+
+

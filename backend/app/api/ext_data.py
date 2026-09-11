@@ -927,11 +927,18 @@ async def test_pull(request: Request, config_id: str):
         data = await _request_json(pull, config.id)
         rows = _extract_rows(data, pull.response_path)
         preview = _apply_field_map(rows[:5], pull.field_map)
+        # 仅当配置声明了 mapped 类型 symbol_map/code_map 时, 才校验 symbol 列;
+        # 否则资金流向类「按非标的维度聚合」数据 (ext_capital_flow) 误报
+        requires_symbol = (
+            (config.symbol_map or {}).get("type") == "mapped"
+            or (config.code_map or {}).get("type") == "mapped"
+        )
         return {
             "status": "ok",
             "total_rows": len(rows),
             "preview": preview,
             "has_symbol": bool(rows and "symbol" in rows[0]),
+            "requires_symbol": requires_symbol,
         }
     except Exception as e:
         raise HTTPException(400, f"测试失败: {e}") from e

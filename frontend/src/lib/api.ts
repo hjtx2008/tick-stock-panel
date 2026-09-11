@@ -2992,7 +2992,7 @@ export const api = {
     ),
 
   extDataPullTest: (id: string) =>
-    request<{ status: string; total_rows: number; preview: Record<string, unknown>[]; has_symbol: boolean }>(
+    request<{ status: string; total_rows: number; preview: Record<string, unknown>[]; has_symbol: boolean; requires_symbol?: boolean }>(
       `/api/ext-data/${id}/pull/test`,
       { method: 'POST' },
     ),

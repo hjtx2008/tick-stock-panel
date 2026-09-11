@@ -32,6 +32,7 @@ def _cfg(mode: str = "timeseries", date_param: str | None = "date") -> ExtConfig
             ExtField("date", "string"), ExtField("heat", "float"),
         ],
         pull=PullConfig(url="https://example.test/rank", date_param=date_param),
+        symbol_map={"type": "mapped", "col": "symbol"},
     )
 
 
