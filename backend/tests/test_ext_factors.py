@@ -5,7 +5,9 @@
 """
 from __future__ import annotations
 
+import logging
 from datetime import date
+from pathlib import Path
 
 import polars as pl
 import pytest
@@ -29,10 +31,12 @@ COL = "ext_tags_hot"  # config_id=tags, field=hot
 def _clean_caches():
     _load_all_cache.clear()
     ext_factors._frame_cache.clear()
+    ext_factors._dim_cache.clear()
     ext_factors._sync_state = None
     yield
     _load_all_cache.clear()
     ext_factors._frame_cache.clear()
+    ext_factors._dim_cache.clear()
     ext_factors._sync_state = None
     # 清理注册表里残留的 ext_ 条目, 不污染其他测试。
     # 直接遍历 _REGISTRY 而不经 all_factors() — 后者会触发惰性同步,
@@ -423,3 +427,86 @@ def test_cjk_string_field_end_to_end(data_dir):
     assert col in frame.columns
     out = custom_signals.inject(frame, custom_signals.build_expressions([sig]))
     assert out["csg_robot"].to_list() == [True]
+
+
+# ── 非 symbol 维度表 (按板块/概念聚合, 无 symbol 列) ──────────
+
+def _write_table(data_dir, cid, mode, df, day="2026-09-11"):
+    """直接落 parquet (绕过 write_ext_parquet 的 symbol 归一化与去重)。"""
+    base = Path(data_dir) / "ext_data" / cid
+    if mode == "timeseries":
+        out = base / "timeseries" / f"date={day}"
+        out.mkdir(parents=True, exist_ok=True)
+        df.write_parquet(out / "part.parquet")
+    else:
+        base.mkdir(parents=True, exist_ok=True)
+        df.write_parquet(base / "part.parquet")
+
+
+def _capital_flow_cfg(data_dir):
+    """ext_capital_flow 形态: 按 industry 聚合, 无 symbol 列。"""
+    return _mk_config(
+        data_dir,
+        cid="ext_capital_flow",
+        mode="timeseries",
+        fields=[
+            ExtField(name="date", dtype="string"),
+            ExtField(name="industry", dtype="string"),
+            ExtField(name="flow_amount", dtype="float"),
+            ExtField(name="direction", dtype="string"),
+        ],
+    )
+
+
+def test_non_symbol_table_not_registered_as_factor(data_dir):
+    """无 symbol 的聚合表不注册因子 —— 否则是一个恒 null 的幽灵因子。"""
+    _capital_flow_cfg(data_dir)
+    _write_table(data_dir, "ext_capital_flow", "timeseries", pl.DataFrame({
+        "date": ["2026-09-11"], "industry": ["半导体"],
+        "flow_amount": [12.5], "direction": ["in"],
+    }))
+    assert ext_factor_specs(data_dir) == []
+
+
+def test_non_symbol_table_not_attached_to_frame(data_dir, caplog):
+    """attach 时静默跳过 (不刷 WARNING 告警), 且不加任何列。"""
+    _capital_flow_cfg(data_dir)
+    _write_table(data_dir, "ext_capital_flow", "timeseries", pl.DataFrame({
+        "date": ["2026-09-11"], "industry": ["半导体"],
+        "flow_amount": [12.5], "direction": ["in"],
+    }))
+    df = _frame([("600519.SH", "2026-09-11", 1700.0)])
+    with caplog.at_level(logging.WARNING):
+        out = ext_factors.attach_ext_columns(df, include_snapshot=True)
+    assert out.columns == df.columns
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_non_symbol_table_absent_from_signal_fields(data_dir):
+    """信号条件下拉同样不出现 (join 不上 → 条件恒 null)。"""
+    _capital_flow_cfg(data_dir)
+    _write_table(data_dir, "ext_capital_flow", "timeseries", pl.DataFrame({
+        "date": ["2026-09-11"], "industry": ["半导体"],
+        "flow_amount": [12.5], "direction": ["in"],
+    }))
+    assert ext_factors.ext_string_field_entries(data_dir) == []
+
+
+def test_symbol_dimension_table_still_attached(data_dir):
+    """回归: 有 symbol 列的表行为不变 (照常 join + 注册)。"""
+    _mk_config(data_dir)
+    _write_table(data_dir, "tags", "timeseries", pl.DataFrame({
+        "symbol": ["600519.SH"], "hot": [8.5], "cnt": [3], "name": ["白酒"],
+    }))
+    df = _frame([("600519.SH", "2026-09-11", 1700.0)])
+    out = ext_factors.attach_ext_columns(df, include_snapshot=True)
+    assert "ext_tags_hot" in out.columns
+    assert out["ext_tags_hot"][0] == 8.5
+    assert "ext_tags_hot" in {s.id for s in ext_factor_specs(data_dir)}
+
+
+def test_dimension_probe_defaults_true_without_data(data_dir):
+    """无数据文件时保守按 symbol 维度 —— 等写入数据后再按真实 schema 判定。"""
+    _mk_config(data_dir)
+    assert ext_factors.is_symbol_dimension(Path(data_dir), _mk_config(data_dir)) is True
+    assert ext_factor_specs(data_dir)  # 空表仍注册因子 (既有行为)

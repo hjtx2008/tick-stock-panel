@@ -269,13 +269,14 @@ def test_fetch_and_ingest_merges_reverse_direction_for_capital_flow():
             assert "po=0" in captured_urls[1]
 
 
-def test_fetch_and_ingest_skips_reverse_when_already_bidirectional():
-    """如果一次拉取已经包含 in+out 双方向 (极端情况), 不重复翻转拉取。"""
+def _run_fetch(rows):
+    """跑一次 fetch_and_ingest, 返回 (写入行数, 实际请求的 URL 列表)。"""
     import asyncio
     import tempfile
+    from datetime import date
     from pathlib import Path
     from unittest.mock import patch
-    from datetime import date
+
     from app.services.ext_data import ExtConfig, ExtField, PullConfig
     from app.services.ext_pull import fetch_and_ingest
 
@@ -284,21 +285,45 @@ def test_fetch_and_ingest_skips_reverse_when_already_bidirectional():
         fields=[ExtField("d","string"),ExtField("i","string"),ExtField("a","float"),ExtField("dir","string")],
         pull=PullConfig(url="https://example.test/x?pn=1&po=1", response_path="data.diff", field_map={}),
     )
-    # 混合方向
+    captured_urls = []
+
+    async def fake_request_json(pull, config_id, day=None):
+        captured_urls.append(pull.url)
+        return {"data": {"diff": rows}}
+
+    with patch(
+        "app.services.ext_pull._request_json", side_effect=fake_request_json
+    ), tempfile.TemporaryDirectory() as tmp:
+        n, _ = asyncio.run(fetch_and_ingest(cfg, Path(tmp), target_date=date(2026, 9, 10)))
+    return n, captured_urls
+
+
+def test_fetch_and_ingest_reverse_pulled_when_rows_insufficient():
+    """单次行数不足 (<150) → 即使已含 in+out 双向也补拉反向。
+
+    EM sectorRank 单页固定 100 行且偏一侧: 若混入极少数反方向行就判定
+    「双向完整」而不再补拉, 会只落 100 行、流出侧几乎为空 (2026-09-11
+    实测流出合计仅 0.03 亿)。故行数不足时无条件补拉。
+    """
     rows = [
         {"f14": "A", "f62": 1e8, "f3": 0.5},
         {"f14": "B", "f62": -1e8, "f3": -0.5},
     ]
-    captured_urls = []
-    async def fake_request_json(pull, config_id, day=None):
-        captured_urls.append(pull.url)
-        return {"data": {"diff": rows}}
-    with patch("app.services.ext_pull._request_json", side_effect=fake_request_json):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            n, _ = asyncio.run(fetch_and_ingest(cfg, tmp, target_date=date(2026, 9, 10)))
-            assert n == 2
-            assert len(captured_urls) == 1, "双向数据不应触发反向拉取"
+    n, urls = _run_fetch(rows)
+    assert len(urls) == 2, "行数不足时应翻转 po 补拉"
+    assert urls[1].endswith("po=0")
+    assert n == 2  # 反向拉取的行业已存在, 去重后无新增
+
+
+def test_fetch_and_ingest_skips_reverse_when_complete_and_bidirectional():
+    """行数充足 (>=150) 且少数方向占比 >=25% → 判定完整, 不重复翻转拉取。"""
+    rows = [
+        {"f14": f"I{i}", "f62": 1e8 if i < 100 else -1e8, "f3": 0.5}
+        for i in range(200)
+    ]
+    n, urls = _run_fetch(rows)
+    assert len(urls) == 1, "双向且完整的数据不应触发反向拉取"
+    assert n == 200
 
 
 def test_symbol_check_passes_when_mapped_col_present():

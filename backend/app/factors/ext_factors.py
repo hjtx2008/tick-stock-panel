@@ -42,6 +42,8 @@ _SIGNAL_DTYPES = _NUMERIC_DTYPES | {"string"}
 
 # 帧缓存: (data_dir, config_id, mode) -> (目录/分区签名, DataFrame)
 _frame_cache: dict[tuple[str, str, str], tuple[tuple, pl.DataFrame]] = {}
+# 维度探测缓存: (data_dir, config_id, mode, 文件签名) -> 是否 symbol 维度
+_dim_cache: dict[tuple[str, str, str, tuple], bool] = {}
 # 注册同步状态: (data_dir, 配置签名); None/失配 → 下次调用重新同步。
 # 已注册集合以注册表为权威 (ext_ 前缀条目), 不单独记账 —— 失效入口清空
 # 状态后, 重新同步仍能从注册表注销已移除的扩展因子。
@@ -49,7 +51,7 @@ _sync_state: tuple | None = None
 
 
 def ext_column_name(config_id: str, field_name: str) -> str:
-    """扩展字段在帧/信号中的列名: ext_{config_id}_{field}。
+    r"""扩展字段在帧/信号中的列名: ext_{config_id}_{field}。
 
     保留中日韩文字 (\w 含 unicode 字母) —— 预设表的字段名多为中文
     (所属概念/股票简称), 全部折叠为 ASCII 会互相碰撞。非单词字符转下划线。
@@ -72,6 +74,56 @@ def _load_configs(data_dir: Path):
     return ExtConfigStore(data_dir).load_all()
 
 
+def _ext_table_path(root: Path, config) -> Path | None:
+    """扩展表当前数据文件: 时序取首个日期分区, 快照取 part.parquet。"""
+    base = root / "ext_data" / config.id
+    if config.mode == "timeseries":
+        for d in sorted((base / "timeseries").glob("date=*")):
+            part = d / "part.parquet"
+            if part.exists():
+                return part
+        return None
+    part = base / "part.parquet"
+    return part if part.exists() else None
+
+
+def is_symbol_dimension(root: Path, config) -> bool:
+    """扩展表是否以 symbol 为维度 —— 决定它能否 join 进标的帧。
+
+    非标的维度的聚合表 (如 ext_capital_flow 按 industry 汇总, 列为
+    date/industry/flow_amount/direction) 没有 symbol 列: 既 join 不进
+    enriched 帧, 也不该注册为因子/信号字段 (选了永远全 null)。这类表由
+    看板走 extDataRows 直接读分区消费, 不经过本模块的列注入通道。
+
+    无数据文件时保守返回 True: 维持既有行为, 等写入数据后再按真实 schema 判定。
+    """
+    path = _ext_table_path(root, config)
+    if path is None:
+        return True
+    try:
+        st = path.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return True
+    key = (str(root), config.id, config.mode, sig)
+    hit = _dim_cache.get(key)
+    if hit is not None:
+        return hit
+    try:
+        # 只读 parquet footer 取 schema, 不加载数据
+        cols = pl.scan_parquet(path).collect_schema().names()
+    except Exception as e:  # 文件损坏/竞态: 保守按 symbol 维度
+        logger.debug("扩展表 %s 维度探测失败, 按 symbol 维度处理: %s", config.id, e)
+        return True
+    ok = "symbol" in cols
+    if len(_dim_cache) > 512:  # 签名含 mtime/size, 长期运行需防膨胀
+        _dim_cache.clear()
+    _dim_cache[key] = ok
+    if not ok:
+        logger.debug("扩展表 %s 非 symbol 维度 (列=%s), 跳过帧 join 与因子注册", config.id, cols)
+    return ok
+
+
 def _numeric_fields(config) -> list:
     return [f for f in config.fields if f.dtype in _NUMERIC_DTYPES]
 
@@ -87,11 +139,16 @@ def ext_string_fields(data_dir: Path | None = None) -> frozenset[str]:
 
 
 def ext_string_field_entries(data_dir: Path | None = None) -> list[dict[str, str]]:
-    """string 扩展字段条目 [{key, label}], 供 /options 与 AI 提示词展示。"""
+    """string 扩展字段条目 [{key, label}], 供 /options 与 AI 提示词展示。
+
+    非 symbol 维度的表 (按板块/概念等聚合) 不产出条目 —— join 不进帧,
+    出现在信号条件下拉里只会得到恒 null 的条件。
+    """
     root = _resolve_dir(data_dir)
     return [
         {"key": ext_column_name(cfg.id, f.name), "label": f"{cfg.label}·{f.label or f.name}"[:40]}
         for cfg in _load_configs(root)
+        if is_symbol_dimension(root, cfg)
         for f in cfg.fields
         if f.dtype == "string"
     ]
@@ -103,10 +160,15 @@ def ext_factor_specs(data_dir: Path | None = None) -> list[FactorSpec]:
     id 含非 ASCII (中文字段名) 的字段跳过注册: DSL 公式标识符是
     ASCII-only, 注册一个公式里写不出来的因子只会误导; 该列仍参与
     帧 join, 信号条件 (数值比较) 照常可用。
+
+    非 symbol 维度的表 (如 ext_capital_flow 按 industry 汇总) 整表跳过注册:
+    它 join 不进标的帧, 注册出来的是一个恒 null 的幽灵因子。
     """
     root = _resolve_dir(data_dir)
     specs: list[FactorSpec] = []
     for cfg in _load_configs(root):
+        if not is_symbol_dimension(root, cfg):
+            continue
         for f in _numeric_fields(cfg):
             fid = ext_column_name(cfg.id, f.name)
             if not fid.isascii():
@@ -188,6 +250,8 @@ def _timeseries_signature(ts_dir: Path) -> tuple | None:
 
 def _select_fields(df: pl.DataFrame, config, fields: list, *, with_date: str | None) -> pl.DataFrame:
     """选列 + 统一 dtype: int/float → Float64 (数值阈值), string → Utf8 (contains)。"""
+    if "symbol" not in df.columns:
+        return pl.DataFrame()  # 非标的维度表: 无法 join, 交由调用方跳过
     exprs = [pl.col("symbol").cast(pl.Utf8)]
     for f in fields:
         name = ext_column_name(config.id, f.name)
@@ -292,6 +356,8 @@ def attach_ext_columns(
             fields = _signal_fields(cfg)
             if not fields:
                 continue
+            if not is_symbol_dimension(root, cfg):
+                continue  # 非标的维度表无法 join, 跳过 (不刷警告)
             try:
                 if cfg.mode == "timeseries":
                     if not has_date:
@@ -337,6 +403,8 @@ def invalidate_ext_caches(data_dir: Path | None = None) -> None:
     root_key = str(_resolve_dir(data_dir))
     for key in [k for k in _frame_cache if k[0] == root_key]:
         _frame_cache.pop(key, None)
+    for key in [k for k in _dim_cache if k[0] == root_key]:
+        _dim_cache.pop(key, None)
     _sync_state = None
     from app.config import settings as _settings
     from app.services import strategy_cache
