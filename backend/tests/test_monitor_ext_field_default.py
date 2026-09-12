@@ -45,11 +45,12 @@ def test_industry_default_matches_preset_field(_isolated):
 
 def test_industry_default_in_ext_presets(_isolated):
     """sanity: ext_presets 里 ext_hy_ths 的字段名确实是 '所属同花顺行业' (锁住上游真相)。"""
-    from app.services.ext_presets import EXT_PRESETS
+    # 走公开接口 get_preset (返回 ExtConfig, 字段是 ExtField 对象而非 dict)
+    from app.services.ext_presets import get_preset
 
-    preset = next((p for p in EXT_PRESETS if p["id"] == "ext_hy_ths"), None)
+    preset = get_preset("ext_hy_ths")
     assert preset is not None, "ext_hy_ths preset 应当存在"
-    field_names = {f["name"] for f in preset["fields"]}
+    field_names = {f.name for f in preset.fields}
     assert "所属同花顺行业" in field_names
     # 防御性: 旧笔误字段名不该出现
     assert "所属同话顺行业" not in field_names
