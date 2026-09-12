@@ -15,8 +15,8 @@ display_name: "tushare"
 runtime: none
 entry: app.plugins.tushare.provider:TushareProvider
 check: app.plugins.tushare.provider:availability
-datasets: [daily, adj_factor]
+datasets: [daily, adj_factor, financial]
 api_key_env: TUSHARE_API_KEY   # 声明后设置页提供 Token 输入框(先探后存, secrets.json 优先)
-description: "Tushare Pro 金融数据接口。日K(未复权原始价, 全市场同步按交易日循环取数, 单次返回全市场故比逐标的快三个数量级; 标的数较少时自动切回逐标的分页模式)、除权因子(官方累积因子序列 → 单事件 pre/post 比值, 与项目 pipeline 的 cum_prod 口径一致)。未声明 minute/realtime/financial → 自动回退现有数据源。"
+description: "Tushare Pro 金融数据接口。日K(未复权原始价, 全市场同步按交易日循环取数, 单次返回全市场故比逐标的快三个数量级; 标的数较少时自动切回逐标的分页模式)、除权因子(官方累积因子序列 → 单事件 pre/post 比值, 与项目 pipeline 的 cum_prod 口径一致)、财务(metrics 走 fina_indicator 批量, 全市场约 111 次请求秒级完成; income/balance_sheet/cash_flow 官方 ts_code 硬必填且不支持批量, 只能逐只, 全市场三表约 16650 次请求; shares 走 daily_basic 按日批量, 单位万股转换 10000 为股)。未声明 minute/realtime → 自动回退现有数据源。"
 install_hint: "点击卡片中的输入框配置 Token(https://tushare.pro 个人中心获取),或在 .env 中配置 TUSHARE_API_KEY"
 homepage: "https://tushare.pro"

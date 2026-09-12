@@ -6,7 +6,9 @@
 实现数据集:
   - daily       A 股日K, 未复权原始价(项目契约: 复权一律由 pipeline 用本地因子计算)
   - adj_factor  A 股除权因子, 由官方累积因子序列还原为单事件 pre/post 比值
-未声明 minute / realtime / financial → provider_has_dataset 为 False, 自动回退现有源。
+  - financial   财务: metrics(fina_indicator 批量) / income / balance_sheet / cash_flow
+                (三者逐只) / shares(daily_basic 按日批量)
+未声明 minute / realtime → provider_has_dataset 为 False, 自动回退现有源。
 
 单位与口径 (CONTRIBUTING §3.1, 不可凭字段名推断):
   - daily.vol     成交量, 单位 **手**   → 与项目日K契约一致, **不转换**
@@ -25,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -38,7 +41,7 @@ from app.plugins.tushare.client import TushareClient, TushareError
 logger = logging.getLogger(__name__)
 
 # 只声明真实提供的数据集; 其余 provider_has_dataset 返回 False → 回退现有数据源
-_DATASETS = ("daily", "adj_factor")
+_DATASETS = ("daily", "adj_factor", "financial")
 
 API_KEY_ENV = "TUSHARE_API_KEY"
 SECRETS_FIELD = "tushare_api_key"  # UI 配置的 Token 存 secrets.json, 优先级高于 .env
@@ -47,6 +50,67 @@ _DATE_MODE_MIN_SYMBOLS = 100   # 标的数达到此值才走"按交易日取全�
 _SYMBOL_BATCH = 30             # 逐标的模式: 每批标的产出一次 chunk(与 on_chunk_done 进度对齐)
 _ADJ_BASELINE_BACKDAYS = 30    # 除权因子需窗口前一个交易日作基准, 向前多取的自然日(覆盖长假)
 _ADJ_EPS = 1e-6                # 因子未变化(非除权日)的判定阈值
+
+# ---- 财务 ----
+_FINANCIAL_HISTORY_PERIODS = 8        # 与 fuyao 插件一致: 首装全量历史取最近 8 期
+_FIN_LATEST_WINDOW_DAYS = 460         # latest_only: 按 ann_date 回看 ~15 个月(必含最新年报+季报)
+_FIN_HISTORY_WINDOW_DAYS = 900        # 全量历史: 回看 ~30 个月 → 覆盖 8 期季报
+_FIN_SYMBOL_INTERVAL_S = 0.08         # 逐只请求节流(实测 30 连发无报错, 留余量)
+_FIN_SHARES_MONTHS = 24               # shares 历史: 取最近 N 个月, 每月最后交易日
+_FIN_FAIL_ABORT_RATIO = 0.5           # 失败标的占比超过此值 → 抛错中止(避免半截数据落库)
+
+# 项目 canonical 表名 → Tushare 接口名
+_STATEMENT_APIS = {
+    "income": "income",
+    "balance_sheet": "balancesheet",
+    "cash_flow": "cashflow",
+}
+
+# Tushare 原始字段 → 项目 canonical 列 (对齐 fuyao 插件的 canonical 命名)
+_INCOME_FIELD_MAP = {
+    "revenue": "revenue",
+    "oper_cost": "operating_cost",
+    "sell_exp": "selling_expense",
+    "admin_exp": "admin_expense",
+    "rd_exp": "rd_expense",
+    "fin_exp": "financial_expense",
+    "operate_profit": "operating_profit",
+    "total_profit": "total_profit",
+    "income_tax": "income_tax",
+    "n_income": "net_income",                    # 净利润(含少数股东损益)
+    "n_income_attr_p": "net_income_attributable",  # 归属母公司净利润
+    "basic_eps": "basic_eps",
+    "total_revenue": "total_revenue",            # 营业总收入(canonical 外扩展列)
+}
+_BALANCE_FIELD_MAP = {
+    "total_assets": "total_assets",
+    "total_cur_assets": "total_current_assets",
+    "total_nca": "total_non_current_assets",
+    "money_cap": "cash_and_equivalents",
+    "accounts_receiv": "accounts_receivable",
+    "total_liab": "total_liabilities",
+    # 含少数股东权益 = 股东权益合计(实测 total_assets - total_liab 恰等于此列)
+    "total_hldr_eqy_inc_min_int": "total_equity",
+    "total_hldr_eqy_exc_min_int": "total_equity_attributable",
+}
+_CASHFLOW_FIELD_MAP = {
+    "n_cashflow_act": "net_operating_cash_flow",
+    "n_cashflow_inv_act": "net_investing_cash_flow",
+    "n_cash_flows_fnc_act": "net_financing_cash_flow",
+    "c_pay_acq_const_fiolta": "capex",
+    "n_incr_cash_cash_equ": "net_cash_change",
+}
+_METRICS_FIELD_MAP = {
+    "roe": "roe",
+    "roa": "roa",
+    "grossprofit_margin": "gross_margin",
+    "netprofit_margin": "net_margin",
+    "debt_to_assets": "debt_to_asset_ratio",
+    "or_yoy": "revenue_yoy",
+    "netprofit_yoy": "net_income_yoy",
+    "eps": "eps",
+    "bps": "bps",
+}
 
 
 def get_api_key() -> str:
@@ -125,6 +189,72 @@ def _to_event_ratios(df: pl.DataFrame) -> pl.DataFrame:
         )
         .select("symbol", "trade_date", "ex_factor")
     )
+
+
+def _iso_date(value) -> str | None:
+    """Tushare YYYYMMDD → ISO 'YYYY-MM-DD'; 不可解析返回 None(不伪造日期)。"""
+    d = tushare_client._parse_date(value)
+    return d.isoformat() if d is not None else None
+
+
+def _month_end_days(days: list[date], months: int) -> list[date]:
+    """从升序交易日列表中取最近 months 个"每月最后交易日"。
+
+    shares 表存的是股本时间序列, 逐日取 24 个月 = 480 次请求不划算,
+    按月抽样(24 次)即可支撑"历史流通股本"的插值使用。
+    """
+    if not days:
+        return []
+    buckets: dict[tuple[int, int], date] = {}
+    for d in days:
+        key = (d.year, d.month)
+        buckets[key] = d  # days 升序 → 同月最后一个覆盖为最晚交易日
+    picked = sorted(buckets.values())
+    return picked[-months:] if months > 0 else picked
+
+
+def _fin_frame(rows: list[dict], field_map: dict[str, str], periods: int) -> pl.DataFrame:
+    """财务原始行 → canonical 帧。
+
+    - 同一报告期(end_date)官方可能返回多行(合并/单季/调整), 只保留
+      「report_type=1 优先, 其次 ann_date 最新」的一行, 避免同期重复落库。
+    - 按 (symbol, period_end) 去重后每只保留最近 periods 期。
+    - 字段缺失一律 None, 不做任何启发式补值。
+    """
+    out: list[dict] = []
+    for r in rows:
+        code = r.get("ts_code")
+        period = _iso_date(r.get("end_date"))
+        if not code or not period:
+            continue
+        row: dict = {
+            "symbol": code,
+            "period_end": period,
+            "announce_date": _iso_date(r.get("ann_date")),
+            "_rt": 0 if str(r.get("report_type") or "") == "1" else 1,
+        }
+        for src, dst in field_map.items():
+            row[dst] = _to_float(r.get(src))
+        out.append(row)
+    if not out:
+        return pl.DataFrame()
+
+    df = pl.DataFrame(out)
+    # _rt: report_type=1(合并报表)优先; 同期内再取 ann_date 最新
+    df = (
+        df.sort(["symbol", "period_end", "_rt", "announce_date"],
+                descending=[False, False, False, True])
+        .unique(subset=["symbol", "period_end"], keep="first")
+        .drop("_rt")
+    )
+    if periods > 0:
+        df = (
+            df.sort(["symbol", "period_end"], descending=[False, True])
+            .group_by("symbol", maintain_order=True)
+            .head(periods)
+            .sort(["symbol", "period_end"])
+        )
+    return df
 
 
 class TushareProvider:
@@ -334,6 +464,124 @@ class TushareProvider:
         )
 
     # ---- 测试(设置页试拉) ----
+    # ---- financial ----
+    def get_financials(
+        self,
+        table: str,
+        symbols: list[str],
+        latest_only: bool = True,
+    ) -> pl.DataFrame:
+        """财务数据 → canonical 列(symbol/period_end/announce_date/指标)。
+
+        - metrics: fina_indicator **支持批量**(单次封顶 100 行, 客户端折半兜底)
+          → 全市场 ≈ 111 次请求, 秒级。这是 Tushare 相对逐只源的最大优势。
+        - income / balance_sheet / cash_flow: ts_code **硬必填且不支持批量**
+          (实测多 code 返回 0 行且不报错) → 逐只, 全市场 3 表 ≈ 16650 次请求。
+        - shares: daily_basic 按交易日取全市场(单次约 5550 行, 1 请求/天),
+          total_share/float_share 单位 **万股 → 乘 10000 转股**。
+        """
+        if not symbols:
+            return pl.DataFrame()
+        if table == "metrics":
+            return self._financial_metrics(symbols, latest_only)
+        if table in _STATEMENT_APIS:
+            field_map = {
+                "income": _INCOME_FIELD_MAP,
+                "balance_sheet": _BALANCE_FIELD_MAP,
+                "cash_flow": _CASHFLOW_FIELD_MAP,
+            }[table]
+            return self._financial_statements(table, field_map, symbols, latest_only)
+        if table == "shares":
+            return self._financial_shares(symbols, latest_only)
+        return pl.DataFrame()
+
+    def _financial_metrics(self, symbols: list[str], latest_only: bool) -> pl.DataFrame:
+        client = self._get_client()
+        window = _FIN_LATEST_WINDOW_DAYS if latest_only else _FIN_HISTORY_WINDOW_DAYS
+        end = date.today()
+        start = end - timedelta(days=window)
+        rows = client.fina_indicator_batch(list(symbols), start, end)
+        if not rows:
+            return pl.DataFrame()
+        periods = 1 if latest_only else _FINANCIAL_HISTORY_PERIODS
+        return _fin_frame(rows, _METRICS_FIELD_MAP, periods)
+
+    def _financial_statements(
+        self,
+        table: str,
+        field_map: dict[str, str],
+        symbols: list[str],
+        latest_only: bool,
+    ) -> pl.DataFrame:
+        api_name = _STATEMENT_APIS[table]
+        client = self._get_client()
+        window = _FIN_LATEST_WINDOW_DAYS if latest_only else _FIN_HISTORY_WINDOW_DAYS
+        end = date.today()
+        start = end - timedelta(days=window)
+        periods = 1 if latest_only else _FINANCIAL_HISTORY_PERIODS
+
+        all_rows: list[dict] = []
+        failed = 0
+        for i, sym in enumerate(symbols):
+            if i:
+                time.sleep(_FIN_SYMBOL_INTERVAL_S)
+            try:
+                all_rows.extend(client.statement_by_symbol(api_name, sym, start, end))
+            except TushareError as e:
+                failed += 1
+                logger.warning("Tushare 财务 %s %s 失败: %s", table, sym, e)
+        if symbols and failed / len(symbols) > _FIN_FAIL_ABORT_RATIO:
+            raise TushareError(
+                f"Tushare 财务 {table} 失败率过高: {failed}/{len(symbols)}"
+            )
+        if not all_rows:
+            return pl.DataFrame()
+        return _fin_frame(all_rows, field_map, periods)
+
+    def _financial_shares(self, symbols: list[str], latest_only: bool) -> pl.DataFrame:
+        """总股本/流通股本: daily_basic 按交易日批量取, 单位万股 → 股。"""
+        client = self._get_client()
+        end = date.today()
+        days: list[date] = []
+        try:
+            days = client.trade_days(end - timedelta(days=_FIN_SHARES_MONTHS * 32), end)
+        except TushareError as e:
+            logger.warning("Tushare 交易日历不可用, shares 回退最近交易日: %s", e)
+        days = _month_end_days(days, _FIN_SHARES_MONTHS) if not latest_only else (days[-1:] if days else [])
+
+        out: list[dict] = []
+        for day in days:
+            try:
+                rows = client.daily_basic_by_date(day)
+            except TushareError as e:
+                logger.warning("Tushare daily_basic %s 失败: %s", day, e)
+                continue
+            wanted = set(symbols)
+            for r in rows:
+                code = r.get("ts_code")
+                if code not in wanted:
+                    continue
+                total_wan = _to_float(r.get("total_share"))
+                float_wan = _to_float(r.get("float_share"))
+                out.append(
+                    {
+                        "symbol": code,
+                        # 股本以"该交易日可用"落库: period_end 记交易日, 与
+                        # share_capital.apply_historical_float_shares 的口径一致
+                        "period_end": day.isoformat(),
+                        "announce_date": day.isoformat(),
+                        "total_shares": None if total_wan is None else total_wan * 10000,
+                        "float_shares": None if float_wan is None else float_wan * 10000,
+                    }
+                )
+        if not out:
+            return pl.DataFrame()
+        return (
+            pl.DataFrame(out)
+            .sort(["symbol", "period_end"])
+            .unique(subset=["symbol", "period_end"], keep="last")
+        )
+
     def test_dataset(self, dataset: str, symbols: list[str] | None = None) -> dict:
         """设置页「试拉测试」。返回 rows / columns / preview, 失败返回 error。"""
         if dataset == "daily":
@@ -350,6 +598,16 @@ class TushareProvider:
                 df = self.get_adj_factors(
                     syms, datetime.now() - timedelta(days=365), datetime.now()
                 )
+            except TushareError as e:
+                return {"provider": self.name, "dataset": dataset, "rows": 0, "error": str(e)}
+            return _preview(self.name, dataset, df)
+
+        if dataset == "financial":
+            # 试拉只验证连通性与字段, 固定走 metrics(批量接口, 秒级返回);
+            # 三表逐只模式耗时与标的数成正比, 不适合放在"试拉"里。
+            syms = [s for s in (symbols or [])][:3] or ["000001.SZ", "600519.SH"]
+            try:
+                df = self.get_financials("metrics", syms, latest_only=True)
             except TushareError as e:
                 return {"provider": self.name, "dataset": dataset, "rows": 0, "error": str(e)}
             return _preview(self.name, dataset, df)

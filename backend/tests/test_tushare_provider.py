@@ -43,6 +43,31 @@ class _FakeClient:
         self.fail_on = fail_on or set()
         self.probe_rows = probe_rows if probe_rows is not None else [{"ts_code": "000001.SZ"}]
         self.calls: list[tuple] = []
+        # ---- 财务 ----
+        self.fina_indicator_rows: list[dict] = []
+        self.statement_rows: dict[str, list[dict]] = {}      # api_name -> rows
+        self.daily_basic_by_date_map: dict[str, list[dict]] = {}
+        self.fina_batch_sizes: list[int] = []                # 记录每批请求标的数
+
+    def fina_indicator_batch(self, ts_codes, start, end):
+        self.calls.append(("fina_indicator_batch", tuple(ts_codes), start, end))
+        self.fina_batch_sizes.append(len(ts_codes))
+        self._maybe_fail("fina_indicator_batch")
+        wanted = set(ts_codes)
+        return [r for r in self.fina_indicator_rows if r.get("ts_code") in wanted]
+
+    def statement_by_symbol(self, api_name, ts_code, start, end):
+        self.calls.append(("statement_by_symbol", api_name, ts_code, start, end))
+        self._maybe_fail(f"statement_by_symbol:{ts_code}")
+        return [
+            r for r in self.statement_rows.get(api_name, [])
+            if r.get("ts_code") == ts_code
+        ]
+
+    def daily_basic_by_date(self, day):
+        self.calls.append(("daily_basic_by_date", day))
+        self._maybe_fail(f"daily_basic_by_date:{day}")
+        return list(self.daily_basic_by_date_map.get(day.strftime("%Y%m%d"), []))
 
     # ---- 记录 + 可选失败注入 ----
     def _maybe_fail(self, key: str):
@@ -453,12 +478,15 @@ def test_adj_factor_non_stock_returns_empty(monkeypatch):
 # ---- 能力声明 / 设置页试拉 ----
 
 
-def test_only_daily_and_adj_factor_declared(monkeypatch):
-    """未声明的数据集 provider_has_dataset 必须为 False → 自动回退现有源。"""
+def test_only_declared_datasets_available(monkeypatch):
+    """未声明的数据集 provider_has_dataset 必须为 False → 自动回退现有源。
+
+    financial 已在 P1 接入 (见 tests/test_tushare_financial.py), 此处一并断言存在。
+    """
     p = _provider(monkeypatch, _FakeClient())
-    assert "daily" in p.config.datasets
-    assert "adj_factor" in p.config.datasets
-    for ds in ("minute", "realtime", "financial", "full_minute"):
+    for ds in ("daily", "adj_factor", "financial"):
+        assert ds in p.config.datasets
+    for ds in ("minute", "realtime", "full_minute"):
         assert ds not in p.config.datasets
 
 

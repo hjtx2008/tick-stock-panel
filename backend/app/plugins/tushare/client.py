@@ -40,6 +40,32 @@ _DAILY_FIELDS = "ts_code,trade_date,open,high,low,close,vol,amount"
 _ADJ_FACTOR_FIELDS = "ts_code,trade_date,adj_factor"
 _TRADE_CAL_FIELDS = "cal_date,is_open"
 
+# ---- 财务字段清单 (2026-09 实测确认存在, 缺失字段会被接口静默忽略) ----
+# 实测被拒/不存在的: ebit_yoy, or_last_year (已从清单剔除)
+_FINA_INDICATOR_FIELDS = (
+    "ts_code,ann_date,end_date,eps,dt_eps,bps,roe,roe_waa,roe_dt,roa,"
+    "netprofit_margin,grossprofit_margin,debt_to_assets,netprofit_yoy,or_yoy,ocfps,op_yoy,tr_yoy"
+)
+_INCOME_FIELDS = (
+    "ts_code,ann_date,end_date,report_type,revenue,oper_cost,sell_exp,admin_exp,rd_exp,"
+    "fin_exp,operate_profit,total_profit,income_tax,n_income,n_income_attr_p,basic_eps,total_revenue"
+)
+_BALANCE_FIELDS = (
+    "ts_code,ann_date,end_date,report_type,total_assets,total_cur_assets,total_nca,"
+    "money_cap,accounts_receiv,total_liab,total_hldr_eqy_inc_min_int,total_hldr_eqy_exc_min_int"
+)
+_CASHFLOW_FIELDS = (
+    "ts_code,ann_date,end_date,report_type,n_cashflow_act,n_cashflow_inv_act,"
+    "n_cash_flows_fnc_act,c_pay_acq_const_fiolta,n_incr_cash_cash_equ"
+)
+_DAILY_BASIC_FIELDS = "ts_code,trade_date,total_share,float_share,total_mv,circ_mv"
+
+# fina_indicator 单次返回封顶 100 行(超出静默截断, 不报错)。
+# 单标的在同一区间可能返回多行(多期), 故批量取 50 留一倍余量, 并在触顶时折半重拉。
+_FINA_ROW_CAP = 100
+_FINA_BATCH = 50
+_MAX_HALVE_DEPTH = 3
+
 
 class TushareError(Exception):
     """Tushare 接口错误(配置缺失 / 网络失败 / 信封 code != 0)。"""
@@ -202,6 +228,85 @@ class TushareClient:
             "adj_factor",
             {"ts_code": ts_code, "start_date": _yyyymmdd(start), "end_date": _yyyymmdd(end)},
             fields=_ADJ_FACTOR_FIELDS,
+        ):
+            out.extend(page)
+        return out
+
+    # ---- 财务 ----
+    def _query_capped(
+        self,
+        api_name: str,
+        params: dict,
+        fields: str,
+        depth: int = 0,
+    ) -> list[dict]:
+        """带 100 行封顶保护的批量查询: 触顶即把 ts_code 折半重拉(避免静默截断丢数据)。
+
+        分批上限本身已保守(_FINA_BATCH=50), 折半只是兜底: 若某批标的都有多期数据,
+        50 只也可能返回 100 行被截断。
+        """
+        rows = self.query(api_name, params, fields)
+        codes = str(params.get("ts_code") or "").split(",")
+        if len(rows) >= _FINA_ROW_CAP and len(codes) > 1 and depth < _MAX_HALVE_DEPTH:
+            mid = len(codes) // 2
+            return self._query_capped(
+                api_name, {**params, "ts_code": ",".join(codes[:mid])}, fields, depth + 1
+            ) + self._query_capped(
+                api_name, {**params, "ts_code": ",".join(codes[mid:])}, fields, depth + 1
+            )
+        return rows
+
+    def fina_indicator_batch(
+        self, ts_codes: list[str], start: date, end: date
+    ) -> list[dict]:
+        """批量财务指标。ts_code 逗号分隔, 按 _FINA_BATCH 分批 + 折半兜底。
+
+        start/end 按 **ann_date(公告日)** 筛, 不是报告期。
+        """
+        out: list[dict] = []
+        for i in range(0, len(ts_codes), _FINA_BATCH):
+            chunk = ts_codes[i : i + _FINA_BATCH]
+            out.extend(
+                self._query_capped(
+                    "fina_indicator",
+                    {
+                        "ts_code": ",".join(chunk),
+                        "start_date": _yyyymmdd(start),
+                        "end_date": _yyyymmdd(end),
+                    },
+                    fields=_FINA_INDICATOR_FIELDS,
+                )
+            )
+        return out
+
+    def statement_by_symbol(
+        self, api_name: str, ts_code: str, start: date, end: date
+    ) -> list[dict]:
+        """三大报表(income/balancesheet/cashflow)按单标的取区间多期。
+
+        实测: ts_code **硬必填**(不传报 50101), 且**不支持批量**(多 code 返回 0 行且不报错)
+        → 只能逐只。start/end 按 ann_date 筛。
+        """
+        fields = {
+            "income": _INCOME_FIELDS,
+            "balancesheet": _BALANCE_FIELDS,
+            "cashflow": _CASHFLOW_FIELDS,
+        }[api_name]
+        return self.query(
+            api_name,
+            {
+                "ts_code": ts_code,
+                "start_date": _yyyymmdd(start),
+                "end_date": _yyyymmdd(end),
+            },
+            fields=fields,
+        )
+
+    def daily_basic_by_date(self, day: date) -> list[dict]:
+        """按交易日取全市场每日指标(含总股本/流通股本, 单位万股)。单次约 5550 行。"""
+        out: list[dict] = []
+        for page in self.query_paged(
+            "daily_basic", {"trade_date": _yyyymmdd(day)}, fields=_DAILY_BASIC_FIELDS
         ):
             out.extend(page)
         return out
