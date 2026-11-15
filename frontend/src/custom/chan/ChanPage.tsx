@@ -61,6 +61,9 @@ const SIGNAL_PRICE_RATIO: Record<string, number> = {
   s1: 1.025,
   s2: 1.015,
   s3: 1.005,
+  // 结构一买/一卖 (czsc 口径) 与趋势一买/一卖可能落在同一根 K 线, 再往外错开一档
+  b1s: 0.965,
+  s1s: 1.035,
 }
 
 /**

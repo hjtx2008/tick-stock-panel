@@ -19,6 +19,8 @@ const SIGNAL_KINDS = [
   { value: 's1', label: '一卖' },
   { value: 's2', label: '二卖' },
   { value: 's3', label: '三卖' },
+  { value: 'b1s', label: '结构一买' },
+  { value: 's1s', label: '结构一卖' },
 ]
 
 const TREND_OPTIONS = [
@@ -51,6 +53,8 @@ const SIGNAL_LABEL: Record<string, string> = {
   s1: '一卖',
   s2: '二卖',
   s3: '三卖',
+  b1s: '结构一买',
+  s1s: '结构一卖',
 }
 
 function fmtNum(value: number | undefined | null, digits = 2): string {

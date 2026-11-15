@@ -100,22 +100,35 @@ def _stroke(direction: str, start: Fractal, end: Fractal, k_count: int) -> Strok
 
 
 def test_merge_klines_merges_containing_bars() -> None:
-    """第二根被第一根包含 → 合并成一根, 区间 [0,1]。"""
-    merged = merge_klines([11.0, 10.8, 12.0], [10.0, 10.2, 11.0], _dates(3))
-    assert len(merged) == 2
-    assert merged[0].start_index == 0
-    assert merged[0].end_index == 1
-    # 首两根构成包含关系时方向由高点关系决定: 当前高 10.8 < 前高 11 → 下降方向
-    assert merged[0].high == 10.8
-    assert merged[0].low == 10.0
+    """向上方向 (前两根高点抬升) 遇包含 → 高高: 高取较高、低取较高。"""
+    merged = merge_klines([10.0, 11.0, 10.8, 12.0], [9.0, 10.0, 10.2, 11.0], _dates(4))
+    assert len(merged) == 3
+    assert (merged[1].start_index, merged[1].end_index) == (1, 2)
+    assert merged[1].high == 11.0
+    assert merged[1].low == 10.2
+    assert merged[2].start_index == 3
 
 
 def test_merge_klines_down_direction_takes_lower() -> None:
-    """未被包含的 K 线原样保留, 方向随之翻转。"""
+    """向下方向 (前两根高点降低) 遇包含 → 低低: 高取较低、低取较低。"""
+    merged = merge_klines([12.0, 11.0, 10.8, 10.0], [11.0, 10.0, 10.2, 9.0], _dates(4))
+    assert len(merged) == 3
+    assert (merged[1].start_index, merged[1].end_index) == (1, 2)
+    assert merged[1].high == 10.8
+    assert merged[1].low == 10.0
+
+
+def test_merge_klines_never_merges_first_two_bars() -> None:
+    """8A (czsc remove_include): 前两根没有可供定向的前一根, 即使包含也不合并。"""
     merged = merge_klines([11.0, 10.8, 12.0], [10.0, 10.2, 11.0], _dates(3))
-    assert merged[1].high == 12.0
-    assert merged[1].low == 11.0
-    assert merged[1].start_index == 2
+    assert len(merged) == 3
+    assert [m.start_index for m in merged] == [0, 1, 2]
+
+
+def test_merge_klines_equal_highs_skip_merge() -> None:
+    """前两根合并 K 高点相等 → 方向不明, 第三根即使被包含也不合并。"""
+    merged = merge_klines([10.0, 10.0, 9.8], [9.0, 8.5, 8.8], _dates(3))
+    assert len(merged) == 3
 
 
 def test_merge_klines_keeps_non_containing_bars() -> None:
@@ -138,10 +151,14 @@ def test_find_fractals_detects_top_and_bottom() -> None:
 
 
 def test_find_fractals_requires_both_high_and_low_extreme() -> None:
-    """高点最高但低点不是最高 → 不成顶分型 (严格原文版)。"""
-    highs = [10.0, 12.0, 11.0, 11.5]
-    lows = [9.0, 8.0, 9.5, 9.0]
-    merged = merge_klines(highs, lows, _dates(4))
+    """高点最高但低点不是最高 → 不成顶分型 (严格原文版)。
+
+    前两根不做包含合并 (8A), 才能留下「高点最高、低点居中」的中间 K。
+    """
+    highs = [10.0, 12.0, 11.0]
+    lows = [9.0, 8.0, 7.0]
+    merged = merge_klines(highs, lows, _dates(3))
+    assert len(merged) == 3
     fractals = find_fractals(merged, ChanParams())
     assert not any(f.kind == "top" and f.merged_index == 1 for f in fractals)
 
@@ -207,53 +224,58 @@ def _three_strokes() -> list[Stroke]:
     ]
 
 
-def test_divergence_requires_smaller_amplitude_or_strength() -> None:
-    """幅度变小 → 笔背离成立 (D6 判定式)。"""
-    strokes = _three_strokes()
-    divs = detect_bi_divergence(strokes, ChanParams())
-    last = next(d for d in divs if d.stroke_index == 3)
-    assert last.days_ok is True
-    assert last.amplitude_ok is True
-    assert last.diverged is True
+def _div_strokes(last_end: float, last_len: int, last_vol: float, prev_vol: float = 1000.0) -> list[Stroke]:
+    """涨-跌-涨-跌四笔; 第 2 笔 15→9 (长度 8), 末笔 14→last_end 与其比较。"""
+    from dataclasses import replace
+
+    base = [
+        _stroke("up", _fractal("bottom", 9.0, "2026-01-05", 0), _fractal("top", 15.0, "2026-01-12", 6), 6),
+        _stroke("down", _fractal("top", 15.0, "2026-01-12", 6), _fractal("bottom", 9.0, "2026-01-19", 12), 6),
+        _stroke("up", _fractal("bottom", 9.0, "2026-01-19", 12), _fractal("top", 14.0, "2026-01-26", 18), 6),
+        _stroke("down", _fractal("top", 14.0, "2026-01-26", 18), _fractal("bottom", last_end, "2026-02-02", 24), 6),
+    ]
+    base[1] = replace(base[1], bar_count=8, volume=prev_vol)
+    base[3] = replace(base[3], bar_count=last_len, volume=last_vol)
+    return base
+
+
+def _div_at(strokes: list[Stroke], index: int):
+    return next(d for d in detect_bi_divergence(strokes, ChanParams()) if d.stroke_index == index)
+
+
+def test_divergence_price_and_length_decay() -> None:
+    """5C (czsc): 创新低 + 价差衰减 + 长度缩短 → 背驰。"""
+    d = _div_at(_div_strokes(last_end=8.5, last_len=6, last_vol=1200.0), 3)
+    assert (d.bi_ok, d.price_ok, d.length_ok, d.volume_ok) == (True, True, True, False)
+    assert d.diverged is True
+
+
+def test_divergence_volume_decay_without_shorter_length() -> None:
+    """长度更长但成交量萎缩 → 仍是背驰 (成交量与长度是「或」)。"""
+    d = _div_at(_div_strokes(last_end=8.5, last_len=10, last_vol=400.0), 3)
+    assert (d.price_ok, d.length_ok, d.volume_ok) == (True, False, True)
+    assert d.diverged is True
 
 
 def test_divergence_not_triggered_when_amplitude_grows() -> None:
-    """幅度变大且天数更少 → 不成立。"""
-    strokes = _three_strokes()
-    bigger = _stroke(
-        "down",
-        _fractal("top", 15.0, "2026-01-26", 18),
-        _fractal("bottom", 8.0, "2026-02-02", 24),
-        3,
-    )
-    strokes = [*strokes[:3], bigger]
-    divs = detect_bi_divergence(strokes, ChanParams())
-    last = next(d for d in divs if d.stroke_index == 3)
-    assert last.days_ok is False
-    assert last.amplitude_ok is False
-    assert last.diverged is False
+    """价差没有衰减 (14→6 幅度 8 > 前笔 6) → 不成立。"""
+    d = _div_at(_div_strokes(last_end=6.0, last_len=6, last_vol=400.0), 3)
+    assert d.price_ok is False
+    assert d.diverged is False
 
 
-def test_divergence_uses_previous_same_direction_stroke() -> None:
-    """前笔 = 上一笔同方向的笔 (相隔一笔), 不是相邻的上一笔。"""
-    strokes = _three_strokes()
-    divs = detect_bi_divergence(strokes, ChanParams())
-    last = next(d for d in divs if d.stroke_index == 3)
-    assert last.prev_index == 1
+def test_divergence_requires_new_extreme() -> None:
+    """末笔没有创新低 (低点 12 > 前低 9) → 无背驰可言。"""
+    d = _div_at(_div_strokes(last_end=12.0, last_len=6, last_vol=400.0), 3)
+    assert d.bi_ok is False
+    assert d.diverged is False
 
 
-def test_divergence_strength_only_case() -> None:
-    """幅度持平但力度变小 → 仍算背离。"""
-    strokes = [
-        _stroke("down", _fractal("top", 15.0, "2026-01-05", 0), _fractal("bottom", 9.0, "2026-01-12", 6), 4),
-        _stroke("up", _fractal("bottom", 9.0, "2026-01-12", 6), _fractal("top", 15.0, "2026-01-19", 12), 4),
-        _stroke("down", _fractal("top", 15.0, "2026-01-19", 12), _fractal("bottom", 9.0, "2026-01-26", 18), 8),
-    ]
-    divs = detect_bi_divergence(strokes, ChanParams())
-    last = next(d for d in divs if d.stroke_index == 2)
-    assert last.amplitude_ok is False
-    assert last.strength_ok is True
-    assert last.diverged is True
+def test_divergence_without_volume_data_relies_on_length() -> None:
+    """无成交量数据 (全 0): 成交量条件恒不成立, 只能靠长度缩短。"""
+    d = _div_at(_div_strokes(last_end=8.5, last_len=10, last_vol=0.0, prev_vol=0.0), 3)
+    assert d.volume_ok is False
+    assert d.diverged is False
 
 
 # ================================================================
@@ -527,6 +549,7 @@ def _mk_strokes(spec: list[tuple[str, float, float, int]]) -> list[Stroke]:
                 end=end,
                 k_count=k_count,
                 confirmed_date=end_date,
+                bar_count=k_count,  # 合成样本无包含合并: 合并 K 根数 = 原始根数
             )
         )
         cursor += k_count
@@ -584,7 +607,7 @@ def test_first_buy_signal_on_down_trend_divergence() -> None:
             ("up", 17.0, 21.0, 5),
             ("down", 21.0, 16.5, 5),
             ("up", 16.5, 20.0, 5),
-            ("down", 20.0, 16.2, 6),  # 与第 5 笔同向: 幅度/力度都变小 → 底背驰
+            ("down", 20.0, 16.2, 4),  # 与第 5 笔同向: 创新低、价差变小且更短 → 底背驰 (czsc 口径)
         ]
     )
     pivots = [
@@ -598,8 +621,8 @@ def test_first_buy_signal_on_down_trend_divergence() -> None:
     assert b1, "应产生一类买点"
     assert b1[0].date == strokes[7].end_date
     assert b1[0].price == pytest.approx(16.2)
-    assert b1[0].detail["cur_days"] == 6
-    assert b1[0].detail["prev_days"] == 5
+    assert b1[0].detail["cur_length"] == 4
+    assert b1[0].detail["prev_length"] == 5
 
 
 def test_first_buy_signal_not_repainted_by_later_pivot() -> None:
@@ -618,7 +641,7 @@ def test_first_buy_signal_not_repainted_by_later_pivot() -> None:
         ("up", 17.0, 21.0, 5),
         ("down", 21.0, 16.5, 5),
         ("up", 16.5, 20.0, 5),
-        ("down", 20.0, 16.2, 6),  # 底背驰 → 一买
+        ("down", 20.0, 16.2, 4),  # 底背驰 → 一买
     ]
     later_spec = [
         ("up", 16.2, 17.9, 5),
@@ -877,7 +900,7 @@ def test_second_buy_fires_when_pullback_is_not_divergent() -> None:
             ("up", 17.0, 21.0, 5),
             ("down", 21.0, 16.5, 5),
             ("up", 16.5, 20.0, 5),
-            ("down", 20.0, 16.2, 6),   # 底背驰 → 一买
+            ("down", 20.0, 16.2, 4),   # 底背驰 → 一买
             ("up", 16.2, 19.0, 5),
             ("down", 19.0, 16.5, 5),   # 回抽: 笔数少于前一笔 → 非背驰, 但不破 16.2
         ]
@@ -977,8 +1000,9 @@ def test_segment_amplitude_and_strength_match_stroke_formula() -> None:
     assert seg.strength == pytest.approx(5.0 / 5 * 100)
 
 
-def test_detect_segment_divergence_on_strength_decay() -> None:
-    """同向的下一段幅度/力度衰减 → 段背驰成立。"""
+def _seg_div_case(last_k: int, last_vol: float = 0.0, prev_vol: float = 0.0):
+    from dataclasses import replace
+
     from app.custom.chan.core import detect_segment_divergence
 
     segments = _mk_segments(
@@ -988,57 +1012,29 @@ def test_detect_segment_divergence_on_strength_decay() -> None:
             ("up", 18.0, 23.0, 5, True),   # 2
             ("down", 23.0, 17.0, 5, True),  # 3  ← 前一段 (同向下)
             ("up", 17.0, 21.0, 5, True),   # 4
-            ("down", 21.0, 16.5, 5, True),  # 5  ← 幅度/力度都比第 3 段小
+            ("down", 21.0, 16.5, last_k, True),  # 5  ← 创新低, 幅度 4.5 < 6
         ]
     )
-    divs = detect_segment_divergence(segments, ChanParams())
-    hit = [d for d in divs if d.segment_index == 5]
+    segments[3] = replace(segments[3], volume=prev_vol)
+    segments[1] = replace(segments[1], volume=prev_vol)
+    segments[5] = replace(segments[5], volume=last_vol)
+    hit = [d for d in detect_segment_divergence(segments, ChanParams()) if d.segment_index == 5]
     assert hit, "第 6 段应与第 4 段比较"
-    d = hit[0]
+    return hit[0]
+
+
+def test_detect_segment_divergence_on_price_and_length_decay() -> None:
+    """段级与笔级同构 (czsc 公式): 创新低 + 价差衰减 + 段更短 → 段背驰。"""
+    d = _seg_div_case(last_k=4)
     assert d.prev_index == 3
-    assert d.amplitude_ok is True
-    assert d.strength_ok is True
-    assert d.days_ok is True
+    assert (d.duan_ok, d.price_ok, d.length_ok) == (True, True, True)
     assert d.diverged is True
 
 
-def test_detect_segment_divergence_requires_enough_days() -> None:
-    """段天数不足前段 → 不构成背驰 (与笔级同构的 AND 判据)。"""
-    from app.custom.chan.core import detect_segment_divergence
-
-    segments = _mk_segments(
-        [
-            ("up", 20.0, 25.0, 5, True),
-            ("down", 25.0, 18.0, 5, True),
-            ("up", 18.0, 23.0, 5, True),
-            ("down", 23.0, 17.0, 6, True),   # 前段 6 根
-            ("up", 17.0, 21.0, 4, True),
-            ("down", 21.0, 16.5, 4, True),   # 当前段只有 4 根 → 天数不足
-        ]
-    )
-    divs = detect_segment_divergence(segments, ChanParams())
-    hit = [d for d in divs if d.segment_index == 5]
-    assert hit
-    assert hit[0].days_ok is False
-    assert hit[0].diverged is False
-
-
-def test_detect_segment_divergence_ignores_unconfirmed_tail() -> None:
-    """未确认的末段仍在延伸 → 不参与段背驰判定 (避免刷新抖动)。"""
-    from app.custom.chan.core import detect_segment_divergence
-
-    segments = _mk_segments(
-        [
-            ("up", 20.0, 25.0, 5, True),
-            ("down", 25.0, 18.0, 5, True),
-            ("up", 18.0, 23.0, 5, True),
-            ("down", 23.0, 17.0, 5, True),
-            ("up", 17.0, 21.0, 5, True),
-            ("down", 21.0, 16.5, 5, False),  # 未确认末段
-        ]
-    )
-    divs = detect_segment_divergence(segments, ChanParams())
-    assert all(d.segment_index != 5 for d in divs)
+def test_detect_segment_divergence_longer_segment_needs_volume_decay() -> None:
+    """段更长时只有成交量萎缩才算背驰。"""
+    assert _seg_div_case(last_k=6).diverged is False
+    assert _seg_div_case(last_k=6, last_vol=300.0, prev_vol=1000.0).diverged is True
 
 
 def test_classify_segment_divergence_scope_trend_vs_consolidation() -> None:
@@ -1059,9 +1055,9 @@ def test_classify_segment_divergence_scope_trend_vs_consolidation() -> None:
         segment_index=5,
         prev_index=3,
         duan_ok=True,
-        days_ok=True,
-        amplitude_ok=True,
-        strength_ok=True,
+        price_ok=True,
+        volume_ok=False,
+        length_ok=True,
     )
 
     # 盘整: 两个同向中枢重叠
@@ -1096,3 +1092,139 @@ def test_analyze_exposes_segment_pivots_and_divergences() -> None:
         assert p.nested_level == 1
     for d in structure.segment_divergences:
         assert d.scope in ("trend", "consolidation")
+
+
+# ================================================================
+# 2026-11-15 czsc 对齐 (1A / 3B / 4C / 5C / 7B / 8A)
+# ================================================================
+
+
+def _fx(kind: str, price: float, i: int, high: float | None = None, low: float | None = None) -> Fractal:
+    return Fractal(
+        kind=kind,  # type: ignore[arg-type]
+        price=price,
+        date=f"2026-01-{i + 1:02d}",
+        bar_index=i,
+        merged_index=i,
+        start_index=max(i - 1, 0),
+        end_index=i + 1,
+        confirmed_date=f"2026-01-{i + 2:02d}",
+        high=high,
+        low=low,
+    )
+
+
+def test_stroke_rejects_up_stroke_ending_below_start() -> None:
+    """1A: 底 10.0 之后的顶 9.0 (跳空下行中的反弹顶) 不能连成向上笔。"""
+    strokes = build_strokes([_fx("bottom", 10.0, 0), _fx("top", 9.0, 6)], ChanParams())
+    assert strokes == []
+
+
+def test_stroke_rejects_mutually_containing_fractals() -> None:
+    """1A: 两分型区间互相包含 → 不成笔 (czsc ab_include)。"""
+    a = _fx("bottom", 9.0, 0, high=12.0, low=9.0)
+    b = _fx("top", 11.5, 6, high=11.5, low=9.5)  # [9.5, 11.5] 被 [9, 12] 包含
+    assert build_strokes([a, b], ChanParams()) == []
+    c = _fx("top", 13.0, 6, high=13.0, low=10.0)
+    assert len(build_strokes([a, c], ChanParams())) == 1
+
+
+def test_pivots_partition_like_czsc_get_zs_seq() -> None:
+    """3B: 顺序切分; 某笔完全离开区间时以它开新中枢, ZG/ZD 取中枢前 3 笔。"""
+    from app.custom.chan.core import build_pivots
+
+    # 价格: 10→14→11→13→12 (中枢 A: 前 3 笔 ZG=13 ZD=11)
+    #       → 8 (下破) → 9.5 (反弹完全在 ZD 下方, 开新中枢 B) → 7 → 9 → 7.5
+    prices = [10.0, 14.0, 11.0, 13.0, 12.0, 8.0, 9.5, 7.0, 9.0, 7.5]
+    spec = [("up" if b > a else "down", a, b, 5) for a, b in zip(prices[:-1], prices[1:], strict=True)]
+    strokes = _mk_strokes(spec)
+    pivots = build_pivots(strokes, ChanParams())
+    assert len(pivots) == 2
+    first, second = pivots
+    assert (first.start_index, first.end_index) == (0, 4)  # 下破笔 12→8 仍归入 A
+    assert (first.zg, first.zd) == (13.0, 11.0)
+    assert (second.start_index, second.end_index) == (5, 8)  # 反弹 8→9.5 开启 B
+    assert second.direction == "down"  # 方向 = 进入笔 (下破笔) 的方向
+    assert (second.zg, second.zd) == (9.0, 8.0)  # 前 3 笔 [8,9.5] [7,9.5] [7,9]
+
+
+def test_structural_first_buy_without_trend_pivots() -> None:
+    """4C: czsc 结构一买 (b1s) 不依赖中枢, 与趋势一买并列输出。"""
+    from app.custom.chan.core import build_signals
+
+    strokes = _mk_strokes(
+        [
+            ("down", 20.0, 15.0, 5),
+            ("up", 15.0, 18.0, 5),
+            ("down", 18.0, 13.0, 6),  # 创新低
+            ("up", 13.0, 16.0, 5),
+            ("down", 16.0, 12.5, 4),  # 创新低, 价差 3.5 < 5、更短 → 衰减
+        ]
+    )
+    params = ChanParams()
+    signals = build_signals(strokes, [], [], detect_bi_divergence(strokes, params), params)
+    b1s = [s for s in signals if s.kind == "b1s"]
+    assert [s.date for s in b1s] == [strokes[4].end_date]
+    assert b1s[0].label == "结构一买"
+    assert b1s[0].detail["window_strokes"] == 5
+    assert not [s for s in signals if s.kind == "b1"], "无趋势中枢 → 不出趋势一买"
+
+
+def test_structural_first_buy_needs_lowest_last_low() -> None:
+    from app.custom.chan.core import build_signals
+
+    strokes = _mk_strokes(
+        [
+            ("down", 20.0, 15.0, 5),
+            ("up", 15.0, 18.0, 5),
+            ("down", 18.0, 13.0, 6),
+            ("up", 13.0, 16.0, 5),
+            ("down", 16.0, 13.5, 4),  # 未创新低 → 不是结构一买
+        ]
+    )
+    params = ChanParams()
+    signals = build_signals(strokes, [], [], detect_bi_divergence(strokes, params), params)
+    assert not [s for s in signals if s.kind == "b1s"]
+
+
+def test_third_buy_rejected_when_pullback_too_far_from_pivot() -> None:
+    """7B: 回抽低点 >= 区间最低点 + 1.618 × 关键向上笔均幅 → 离中枢太远, 不是三买。"""
+    from app.custom.chan.core import build_pivots, build_signals
+
+    def b3_dates(prices: list[float]) -> list[str]:
+        spec = [("up" if b > a else "down", a, b, 5) for a, b in zip(prices[:-1], prices[1:], strict=True)]
+        strokes = _mk_strokes(spec)
+        params = ChanParams()
+        pivots = build_pivots(strokes, params)
+        signals = build_signals(strokes, pivots, [], detect_bi_divergence(strokes, params), params)
+        return [s.date for s in signals if s.kind == "b3"]
+
+    # 中枢 [10, 12]; 关键向上笔 8→12 (4)、10→13 (3) 均幅 3.5; 区间最低 8 → 上限 8 + 5.663 = 13.663
+    near = [8.0, 12.0, 10.0, 13.0, 11.0, 16.0, 13.5]
+    far = [8.0, 12.0, 10.0, 13.0, 11.0, 30.0, 25.0]
+    assert b3_dates(near), "回抽 13.5 在上限内 → 三买"
+    assert b3_dates(far) == [], "回抽 25 远离中枢 → 不是三买"
+
+
+def test_analyze_attaches_stroke_volume() -> None:
+    """成交量接入: 笔成交量 = 两端分型中间合并 K 覆盖的原始成交量之和。"""
+    highs = [10, 11, 12, 13, 12, 11, 10, 9, 10, 11, 12]
+    lows = [9, 10, 11, 12, 11, 10, 9, 8, 9, 10, 11]
+    bars = pl.DataFrame(
+        {
+            "date": _dates(len(highs)),
+            "high": [float(h) for h in highs],
+            "low": [float(v) for v in lows],
+            "close": [float(h) - 0.5 for h in highs],
+            "volume": [float(100 * (i + 1)) for i in range(len(highs))],
+        }
+    )
+    st = analyze(bars, ChanParams(price_mode="raw"))
+    assert st.strokes, "样本应成笔"
+    s0 = st.strokes[0]
+    assert s0.volume == sum(100.0 * (i + 1) for i in range(s0.start.bar_index, s0.end.bar_index + 1))
+    assert s0.bar_count == s0.end.merged_index - s0.start.merged_index + 3
+    assert not any("volume_missing" in w for w in st.warnings)
+    no_vol = analyze(bars.drop("volume"), ChanParams(price_mode="raw"))
+    assert any("volume_missing" in w for w in no_vol.warnings)
+    assert all(x.volume == 0.0 for x in no_vol.strokes)

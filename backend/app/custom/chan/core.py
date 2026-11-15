@@ -81,7 +81,8 @@ class ChanParams:
     pivot_level_mode: Literal["flat", "extended"] = "flat"
 
     # ── 背驰 (§4.7) ───────────────────────────────────────────────
-    divergence_mode: Literal["bi_force"] = "bi_force"
+    divergence_mode: Literal["czsc"] = "czsc"
+    """背驰力度口径: czsc ``check_first_buy`` 公式 (5C, 2026-11-15 取代 D6 笔力度公式)。"""
     strength_scale: int = 100
 
     # ── 线段 (§4.4) ───────────────────────────────────────────────
@@ -102,7 +103,7 @@ class ChanParams:
             raise ValueError(f"未知 stroke_version: {self.stroke_version}")
         if self.overlap_mode != "three_strokes":
             raise ValueError(f"未实现的 overlap_mode: {self.overlap_mode}")
-        if self.divergence_mode != "bi_force":
+        if self.divergence_mode != "czsc":
             raise ValueError(f"未实现的 divergence_mode: {self.divergence_mode}")
         if self.pivot_level_mode not in ("flat", "extended"):
             raise ValueError(f"未知 pivot_level_mode: {self.pivot_level_mode}")
@@ -154,6 +155,10 @@ class Fractal:
     start_index: int      # 分型三 K 组合的首根原始 K 线索引
     end_index: int        # 分型三 K 组合的末根原始 K 线索引
     confirmed_date: str   # 分型被确认的日期 (三 K 组合走完的那根 K 线)
+    # 分型中间合并 K 的高低点 —— 成笔时判断两分型区间是否互相包含 (czsc 口径)。
+    # None = 调用方未提供 (如直接构造的测试分型), 此时跳过包含校验。
+    high: float | None = None
+    low: float | None = None
 
     @property
     def is_top(self) -> bool:
@@ -170,6 +175,11 @@ class Stroke:
     k_count: int        # 笔跨越的 K 线根数 (交易日口径)
     confirmed_date: str
     level: ChanLevel = ChanLevel.DAY
+    bar_count: int = 0
+    """笔长度 (czsc ``BI.get_length``): 起点分型首根至终点分型末根的**合并 K** 根数。"""
+    volume: float = 0.0
+    """笔成交量 (czsc ``get_power_volume``): 两端分型中间合并 K 之间的原始成交量之和。
+    0 = 无成交量数据, 背驰的成交量条件不成立。"""
 
     @property
     def amplitude(self) -> float:
@@ -223,7 +233,9 @@ class Segment:
     未确认末段**不参与**任何买卖点判定 (build_signals 也不使用 segments)。
     """
     k_count: int = 0
-    """线段跨越的 K 线根数 (交易日口径) —— 段级别背驰的力度口径需要它。"""
+    """线段跨越的 K 线根数 (交易日口径) —— 段级别背驰的长度口径用它。"""
+    volume: float = 0.0
+    """段成交量: 段起点至段终点原始 K 线的成交量之和 (0 = 无成交量数据)。"""
 
     @property
     def amplitude(self) -> float:
@@ -258,7 +270,8 @@ class Pivot:
 class ChanSignal:
     """买卖点。"""
 
-    kind: Literal["b1", "b2", "b3", "s1", "s2", "s3"]
+    kind: Literal["b1", "b2", "b3", "s1", "s2", "s3", "b1s", "s1s"]
+    """b1s / s1s = 结构一买 / 结构一卖 (czsc 口径, 不要求趋势中枢), 与 b1 / s1 并列。"""
     label: str
     date: str
     price: float
@@ -539,18 +552,27 @@ def merge_klines(highs: Sequence[float], lows: Sequence[float], dates: Sequence[
     """包含处理: 把相互包含的 K 线合并成一根。
 
     合并方向按缠论惯例: 上升方向取"高高", 下降方向取"低低"。
-    方向初始值由前两根 K 线的高点关系确定 (实现细节, 默认向上)。
+
+    方向口径对齐 czsc ``remove_include``: 每次都由**前两根合并 K** 的高点比较决定
+    (后者高 → 向上, 后者低 → 向下); 两者高点相等时方向不明, 不做合并。
+    因此前两根 K 线永不合并 (没有可供定向的前一根)。
     """
     if not (len(highs) == len(lows) == len(dates)):
         raise ValueError("highs/lows/dates 长度不一致")
 
     merged: list[MergedBar] = []
-    direction: str | None = None
 
     for i in range(len(highs)):
         h = float(highs[i])
         low_v = float(lows[i])
-        if not merged:
+        direction: str | None = None
+        if len(merged) >= 2:
+            k1, k2 = merged[-2], merged[-1]
+            if k1.high < k2.high:
+                direction = "up"
+            elif k1.high > k2.high:
+                direction = "down"
+        if direction is None:
             merged.append(
                 MergedBar(
                     high=h,
@@ -571,8 +593,6 @@ def merge_klines(highs: Sequence[float], lows: Sequence[float], dates: Sequence[
             h >= prev.high and low_v <= prev.low
         )
         if contains:
-            if direction is None:
-                direction = "up" if h >= prev.high else "down"
             if direction == "up":
                 if h > prev.high:
                     new_high, new_high_index, new_high_date = h, i, dates[i]
@@ -632,7 +652,6 @@ def merge_klines(highs: Sequence[float], lows: Sequence[float], dates: Sequence[
                     end_date=dates[i],
                 )
             )
-            direction = "up" if h > prev.high else "down"
 
     return merged
 
@@ -664,6 +683,8 @@ def find_fractals(merged: Sequence[MergedBar], params: ChanParams) -> list[Fract
                     start_index=a.start_index,
                     end_index=c.end_index,
                     confirmed_date=c.end_date,
+                    high=b.high,
+                    low=b.low,
                 )
             )
         elif is_bottom:
@@ -677,6 +698,8 @@ def find_fractals(merged: Sequence[MergedBar], params: ChanParams) -> list[Fract
                     start_index=a.start_index,
                     end_index=c.end_index,
                     confirmed_date=c.end_date,
+                    high=b.high,
+                    low=b.low,
                 )
             )
     if params.require_follow_through:
@@ -724,6 +747,17 @@ def _stroke_gap_ok(
     delta = b.merged_index - a.merged_index
     if delta <= 0:
         return False
+
+    # 价格方向 (czsc check_bi): 向上笔终点顶必须高于起点底, 向下笔反之。
+    # 缺这一条时, 跳空下行中的反弹顶 (低于前底) 会被连成一笔"向下走的向上笔"。
+    if a.kind == "bottom" and not b.price > a.price:
+        return False
+    if a.kind == "top" and not b.price < a.price:
+        return False
+    # 两分型区间互相包含 → 不成笔 (czsc check_bi 的 ab_include)
+    if None not in (a.high, a.low, b.high, b.low):
+        if (a.high > b.high and a.low < b.low) or (a.high < b.high and a.low > b.low):
+            return False
 
     if params.stroke_version == "old":
         # 老笔: 两分型可共用一根 K 线 (距离 >= 2), 且原始 K 线跨度 >= 5
@@ -778,6 +812,8 @@ def build_strokes(fractals: Sequence[Fractal], params: ChanParams) -> list[Strok
                 k_count=b.bar_index - a.bar_index + 1,
                 confirmed_date=b.confirmed_date,
                 level=params.level,
+                # 起点分型首根 ~ 终点分型末根的合并 K 根数 (czsc BI.get_length)
+                bar_count=b.merged_index - a.merged_index + 3,
             )
         )
     return strokes
@@ -970,63 +1006,68 @@ def _build_pivots_from_ranges(
     min_units: int,
     nested_level: int,
 ) -> list[Pivot]:
-    """由「连续 N 个价格区间单元」构造中枢 (笔级 / 段级共用)。
+    """由价格区间单元序列构造中枢 (笔级 / 段级共用)。
 
-    中枢 = 连续 ``min_units`` 个单元价格区间的重叠部分;
-    ZG = 区间上沿, ZD = 区间下沿。重叠区间为空则不成中枢 (``strict_overlap``)。
-    ``pivot_level_mode='flat'`` 时中枢区间在延伸过程中不扩张。
+    划分口径对齐 czsc ``get_zs_seq``: 按顺序把每个单元归入当前中枢, 直到某个单元
+    **完全离开**当前中枢区间 (向上单元的高点 < ZD, 或向下单元的低点 > ZG),
+    就以该单元开始一个新中枢。突破中枢的那一笔 (起点仍在区间内) 归入原中枢,
+    其后完全不回区间的那一笔才开启新中枢。
+
+    - ZG / ZD = 中枢**前 ``min_units`` 个单元**的最低高点 / 最高低点
+      (czsc ``ZS``: 前 3 笔); ``pivot_level_mode='extended'`` 时取全体单元的
+      最高点 / 最低点 (区间随延伸扩张)。
+    - 只输出单元数 >= ``min_units`` 且有效的中枢 (czsc ``ZS.is_valid``: ZG >= ZD,
+      每个单元都触及区间); ``strict_overlap`` 要求 ZD < ZG 严格成立。
+    - 方向 = 进入中枢的那一段 (中枢首单元之前的单元) 的方向, 首个中枢取首单元方向。
+      趋势判定 (两个同向中枢不重叠) 依赖这一口径。
     """
-    pivots: list[Pivot] = []
-    n = len(ranges)
-    i = 0
-    while i + min_units - 1 < n:
-        group = ranges[i : i + min_units]
-        zg = min(r.hi for r in group)
-        zd = max(r.lo for r in group)
-        if params.strict_overlap and not (zd < zg):
-            i += 1
+    def _zone(group: list[int]) -> tuple[float, float]:
+        head = [ranges[k] for k in group[:min_units]]
+        return min(r.hi for r in head), max(r.lo for r in head)
+
+    groups: list[list[int]] = []
+    for idx, r in enumerate(ranges):
+        if not groups:
+            groups.append([idx])
             continue
+        zg, zd = _zone(groups[-1])
+        if (r.direction == "up" and r.hi < zd) or (r.direction == "down" and r.lo > zg):
+            groups.append([idx])
+        else:
+            groups[-1].append(idx)
 
-        end = i + min_units - 1
-        # 延伸: 后续单元仍与 [zd, zg] 有重叠
-        j = end + 1
-        while j < n:
-            r = ranges[j]
-            if r.lo <= zg and r.hi >= zd:
-                end = j
-                if params.pivot_level_mode == "extended":
-                    zg = max(zg, r.hi)
-                    zd = min(zd, r.lo)
-                j += 1
-                continue
-            break
-
-        # 中枢方向 = 进入中枢的那一段的方向 (缠论口径), 而不是中枢第一笔的方向;
-        # 否则相邻中枢的方向必然交替, 趋势将永远无法成立。
-        direction = ranges[i - 1].direction if i > 0 else ranges[i].direction
-
+    pivots: list[Pivot] = []
+    for group in groups:
+        if len(group) < min_units:
+            continue
+        zg, zd = _zone(group)
+        if zg < zd or (params.strict_overlap and not zd < zg):
+            continue
+        units = [ranges[k] for k in group]
+        if not all(
+            (zd <= u.hi <= zg) or (zd <= u.lo <= zg) or (u.hi >= zg and u.lo <= zd)
+            for u in units
+        ):
+            continue
+        if params.pivot_level_mode == "extended":
+            zg = max(u.hi for u in units)
+            zd = min(u.lo for u in units)
+        start, end = group[0], group[-1]
+        direction = ranges[start - 1].direction if start > 0 else ranges[start].direction
         pivots.append(
             Pivot(
                 direction=direction,
                 zg=zg,
                 zd=zd,
-                start_date=ranges[i].start_date,
+                start_date=ranges[start].start_date,
                 end_date=ranges[end].end_date,
-                start_index=i,
+                start_index=start,
                 end_index=end,
-                stroke_count=end - i + 1,
+                stroke_count=end - start + 1,
                 level=params.level,
                 nested_level=nested_level,
             )
         )
-
-        # 离开中枢的那一笔: 若它与中枢同向, 则属于中枢之间的走势 (跳过),
-        # 否则它是下一个中枢的"进入段" (计入下一个中枢)。
-        leaving = ranges[end + 1] if end + 1 < n else None
-        i = end + 2 if (leaving is not None and leaving.direction == direction) else end + 1
-        if i >= n:
-            break
-
     return pivots
 
 
@@ -1123,16 +1164,53 @@ def classify_trend(pivots: Sequence[Pivot], strokes: Sequence[Stroke]) -> str:
 # ================================================================
 
 
+def _mean(values: Sequence[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _beyond(cur_end: float, prev_end: float, direction: str) -> bool:
+    """cur 是否比 prev 创出新极值 (向下笔创新低 / 向上笔创新高)。"""
+    return cur_end < prev_end if direction == "down" else cur_end > prev_end
+
+
+def _key_chain(units: Sequence, i: int, end_price) -> list:
+    """第 i 个单元之前、同向且连续创新极值的单元链 (含前一同向单元), czsc 的「关键笔」。
+
+    czsc ``check_first_buy`` 在固定窗口里取「首笔 + 之后每个创新低的同向笔」;
+    逐笔检测没有窗口, 这里取 i-2 往前连续创新极值的那一串作为等价的关键笔集合。
+    """
+    direction = units[i].direction
+    chain = [units[i - 2]]
+    k = i - 2
+    while (
+        k - 2 >= 0
+        and units[k - 2].direction == direction
+        and _beyond(end_price(units[k]), end_price(units[k - 2]), direction)
+    ):
+        chain.append(units[k - 2])
+        k -= 2
+    return chain
+
+
+def _czsc_weaker(cur: float, prev: float, keys: Sequence[float]) -> bool:
+    """czsc 力度衰减判据: 当前值 < max(前一同向单元, 关键单元均值)。"""
+    return cur < max(prev, _mean(keys))
+
+
 @dataclass(frozen=True)
 class Divergence:
-    """笔背驰判定结果。"""
+    """笔背驰判定结果 (czsc ``check_first_buy`` 力度口径)。"""
 
     stroke_index: int
     prev_index: int
     bi_ok: bool
-    days_ok: bool
-    amplitude_ok: bool
-    strength_ok: bool
+    """该笔成立且相对前一同向笔创出新极值 (向下创新低 / 向上创新高); 不创新极值无背驰可言。"""
+    price_ok: bool
+    """价差力度衰减: 笔幅度 < max(前一同向笔幅度, 关键笔幅度均值)。"""
+    volume_ok: bool
+    """成交量衰减: 笔成交量 < max(前一同向笔, 关键笔均值); 无成交量数据时恒为 False。"""
+    length_ok: bool
+    """长度缩短: 笔长度 (合并 K 根数) < max(前一同向笔, 关键笔均值)。"""
     scope: Literal["trend", "consolidation"] = "trend"
     """背驰所处形态: ``trend`` = 趋势背驰, ``consolidation`` = 盘整背驰。
 
@@ -1143,7 +1221,7 @@ class Divergence:
 
     @property
     def diverged(self) -> bool:
-        return self.bi_ok and self.days_ok and (self.amplitude_ok or self.strength_ok)
+        return self.bi_ok and self.price_ok and (self.volume_ok or self.length_ok)
 
     def detail(self, strokes: Sequence[Stroke]) -> dict:
         cur = strokes[self.stroke_index]
@@ -1151,16 +1229,18 @@ class Divergence:
         return {
             "cur_stroke_index": self.stroke_index,
             "prev_stroke_index": self.prev_index,
-            "cur_days": cur.k_count,
-            "prev_days": prev.k_count,
             "cur_amplitude": round(cur.amplitude, 6),
             "prev_amplitude": round(prev.amplitude, 6),
-            "cur_strength": round(cur.strength, 6),
-            "prev_strength": round(prev.strength, 6),
+            "cur_volume": round(cur.volume, 2),
+            "prev_volume": round(prev.volume, 2),
+            "cur_length": cur.bar_count,
+            "prev_length": prev.bar_count,
+            "cur_days": cur.k_count,
+            "prev_days": prev.k_count,
             "bi_ok": self.bi_ok,
-            "days_ok": self.days_ok,
-            "amplitude_ok": self.amplitude_ok,
-            "strength_ok": self.strength_ok,
+            "price_ok": self.price_ok,
+            "volume_ok": self.volume_ok,
+            "length_ok": self.length_ok,
             "scope": self.scope,
         }
 
@@ -1169,38 +1249,29 @@ def detect_bi_divergence(
     strokes: Sequence[Stroke],
     params: ChanParams,
 ) -> list[Divergence]:
-    """逐笔检测背驰。
+    """逐笔检测背驰 (5C: 采用 czsc ``check_first_buy`` 力度公式, 取代 D6)::
 
-    判定式 (D6 拍板)::
+        背驰 := 创新极值
+                AND 价差 < max(前笔价差, 关键笔价差均值)
+                AND ( 成交量 < max(前笔, 关键笔均值)  OR  长度 < max(前笔, 关键笔均值) )
 
-        笔力度 := 笔幅度 / 笔天数 * 100
-        笔背离 := BIOK
-                   AND 笔天数 >= 前笔天数
-                   AND ( 笔幅度 < 前笔幅度  OR  笔力度 < 前笔力度 )
-
-    ``前笔`` = 上一笔**同方向**的笔。``BIOK`` 在本实现中表示"该笔成立"
-    (通过了成笔条件, 终点分型已确认) —— 这正是缠论里"BIOK = 笔成立"的用法;
-    D9 若澄清为别的含义, 只需改这一处判定。
+    ``前笔`` = 上一笔**同方向**的笔; ``关键笔`` 见 ``_key_chain``。
+    价差 = 笔幅度 (绝对价格差); 长度 = 合并 K 根数; 成交量 = 笔内原始成交量之和。
     """
     out: list[Divergence] = []
-    n = len(strokes)
-    for i in range(1, n):
-        cur = strokes[i]
-        prev = strokes[i - 2] if i >= 2 else None
-        if prev is None or prev.direction != cur.direction:
+    for i in range(2, len(strokes)):
+        cur, prev = strokes[i], strokes[i - 2]
+        if prev.direction != cur.direction:
             continue
-        bi_ok = True  # BIOK: 该笔成立 (由 build_strokes 保证)
-        days_ok = cur.k_count >= prev.k_count
-        amplitude_ok = cur.amplitude < prev.amplitude
-        strength_ok = cur.strength < prev.strength
+        keys = _key_chain(strokes, i, lambda u: u.end.price)
         out.append(
             Divergence(
                 stroke_index=i,
                 prev_index=i - 2,
-                bi_ok=bi_ok,
-                days_ok=days_ok,
-                amplitude_ok=amplitude_ok,
-                strength_ok=strength_ok,
+                bi_ok=_beyond(cur.end.price, prev.end.price, cur.direction),
+                price_ok=_czsc_weaker(cur.amplitude, prev.amplitude, [k.amplitude for k in keys]),
+                volume_ok=_czsc_weaker(cur.volume, prev.volume, [k.volume for k in keys]),
+                length_ok=_czsc_weaker(cur.bar_count, prev.bar_count, [k.bar_count for k in keys]),
             )
         )
     return out
@@ -1242,22 +1313,23 @@ def classify_divergence_scope(
 class SegmentDivergence:
     """段背驰判定结果 (段级别)。
 
-    与笔背驰 (``Divergence``) 结构同构, 但比较单元是**线段**:
-    段幅度 / 段天数 / 段力度的口径与笔完全一致 (只是把「笔」换成「段」)。
+    与笔背驰 (``Divergence``) 判定式同构, 比较单元换成**线段**;
+    段长度用原始 K 线根数 (``k_count``), 段成交量为段内原始成交量之和。
     """
 
     segment_index: int
     prev_index: int
     duan_ok: bool
-    days_ok: bool
-    amplitude_ok: bool
-    strength_ok: bool
+    """该段成立且相对前一同向段创出新极值。"""
+    price_ok: bool
+    volume_ok: bool
+    length_ok: bool
     scope: Literal["trend", "consolidation"] = "trend"
     """段背驰的形态归属, 判据同笔级 (见 ``classify_divergence_scope``)。"""
 
     @property
     def diverged(self) -> bool:
-        return self.duan_ok and self.days_ok and (self.amplitude_ok or self.strength_ok)
+        return self.duan_ok and self.price_ok and (self.volume_ok or self.length_ok)
 
     def detail(self, segments: Sequence[Segment]) -> dict:
         cur = segments[self.segment_index]
@@ -1265,16 +1337,16 @@ class SegmentDivergence:
         return {
             "cur_segment_index": self.segment_index,
             "prev_segment_index": self.prev_index,
-            "cur_days": cur.k_count,
-            "prev_days": prev.k_count,
             "cur_amplitude": round(cur.amplitude, 6),
             "prev_amplitude": round(prev.amplitude, 6),
-            "cur_strength": round(cur.strength, 6),
-            "prev_strength": round(prev.strength, 6),
+            "cur_volume": round(cur.volume, 2),
+            "prev_volume": round(prev.volume, 2),
+            "cur_days": cur.k_count,
+            "prev_days": prev.k_count,
             "duan_ok": self.duan_ok,
-            "days_ok": self.days_ok,
-            "amplitude_ok": self.amplitude_ok,
-            "strength_ok": self.strength_ok,
+            "price_ok": self.price_ok,
+            "volume_ok": self.volume_ok,
+            "length_ok": self.length_ok,
             "scope": self.scope,
         }
 
@@ -1283,41 +1355,25 @@ def detect_segment_divergence(
     segments: Sequence[Segment],
     params: ChanParams,
 ) -> list[SegmentDivergence]:
-    """逐段检测背驰 (段级别)。
+    """逐段检测背驰 (段级别), 判定式与笔级同构 (见 ``detect_bi_divergence``)。
 
-    判定式与笔级完全同构 (D6 拍板口径), 只是把比较单元从「笔」换成「段」::
-
-        段力度 := 段幅度 / 段天数 * 100
-        段背离 := 段成立
-                   AND 段天数 >= 前段天数
-                   AND ( 段幅度 < 前段幅度  OR  段力度 < 前段力度 )
-
-    ``前段`` = 上一段**同方向**的线段。
-
-    未确认的末段 (``confirmed=False``) 仍在延伸, 幅度/天数都可能继续变化,
-    因此**不参与**段背驰判定 —— 否则每次刷新都会抖出新的段背驰。
+    ``前段`` = 上一段**同方向**的线段。未确认的末段 (``confirmed=False``) 仍在延伸,
+    幅度/长度都可能继续变化, 因此**不参与**段背驰判定 —— 否则每次刷新都会抖出新的段背驰。
     """
     out: list[SegmentDivergence] = []
-    n = len(segments)
-    for i in range(1, n):
-        cur = segments[i]
-        if not cur.confirmed:
+    for i in range(2, len(segments)):
+        cur, prev = segments[i], segments[i - 2]
+        if not cur.confirmed or not prev.confirmed or prev.direction != cur.direction:
             continue
-        prev = segments[i - 2] if i >= 2 else None
-        if prev is None or prev.direction != cur.direction or not prev.confirmed:
-            continue
-        duan_ok = True  # 段成立 (由 build_segments 保证)
-        days_ok = cur.k_count >= prev.k_count
-        amplitude_ok = cur.amplitude < prev.amplitude
-        strength_ok = cur.strength < prev.strength
+        keys = [k for k in _key_chain(segments, i, lambda u: u.end_price) if k.confirmed]
         out.append(
             SegmentDivergence(
                 segment_index=i,
                 prev_index=i - 2,
-                duan_ok=duan_ok,
-                days_ok=days_ok,
-                amplitude_ok=amplitude_ok,
-                strength_ok=strength_ok,
+                duan_ok=_beyond(cur.end_price, prev.end_price, cur.direction),
+                price_ok=_czsc_weaker(cur.amplitude, prev.amplitude, [k.amplitude for k in keys]),
+                volume_ok=_czsc_weaker(cur.volume, prev.volume, [k.volume for k in keys]),
+                length_ok=_czsc_weaker(cur.k_count, prev.k_count, [k.k_count for k in keys]),
             )
         )
     return out
@@ -1356,6 +1412,76 @@ def _pivot_direction_after(pivots: Sequence[Pivot], stroke_index: int) -> str | 
         if p.start_index <= stroke_index <= p.end_index:
             return p.direction
     return None
+
+
+_FIRST_POINT_WINDOWS = (21, 19, 17, 15, 13, 11, 9, 7, 5)
+_THIRD_POINT_REACH = 1.618
+
+
+def _stroke_high(s: Stroke) -> float:
+    return max(s.start.price, s.end.price)
+
+
+def _stroke_low(s: Stroke) -> float:
+    return min(s.start.price, s.end.price)
+
+
+def _check_first_point(bis: Sequence[Stroke], last_direction: str) -> bool:
+    """czsc ``check_first_buy`` / ``check_first_sell`` 的结构判定 (一买以向下笔收尾)。
+
+    - 奇数笔, 首末同向且与 ``last_direction`` 一致;
+    - 一买: 首笔高点是窗口最高、末笔低点是窗口最低 (一卖镜像);
+    - 关键笔 = 首笔 + 之后每个比前一同向笔创新低 (新高) 的同向笔;
+    - 价差衰减 AND (成交量衰减 OR 长度缩短), 比较基准 = max(倒数第三笔, 关键笔均值)。
+    """
+    if len(bis) % 2 != 1 or bis[0].direction != last_direction or bis[-1].direction != last_direction:
+        return False
+    down = last_direction == "down"
+    highs = [_stroke_high(b) for b in bis]
+    lows = [_stroke_low(b) for b in bis]
+    if down and (max(highs) != highs[0] or min(lows) != lows[-1]):
+        return False
+    if not down and (min(lows) != lows[0] or max(highs) != highs[-1]):
+        return False
+    keys = [bis[0]]
+    for k in range(2, len(bis) - 2, 2):
+        prev_extreme = _stroke_low(bis[k - 2]) if down else _stroke_high(bis[k - 2])
+        extreme = _stroke_low(bis[k]) if down else _stroke_high(bis[k])
+        if (extreme < prev_extreme) if down else (extreme > prev_extreme):
+            keys.append(bis[k])
+    last, prev = bis[-1], bis[-3]
+    price_ok = _czsc_weaker(last.amplitude, prev.amplitude, [k.amplitude for k in keys])
+    volume_ok = _czsc_weaker(last.volume, prev.volume, [k.volume for k in keys])
+    length_ok = _czsc_weaker(last.bar_count, prev.bar_count, [k.bar_count for k in keys])
+    return price_ok and (volume_ok or length_ok)
+
+
+def _third_point_within_reach(
+    strokes: Sequence[Stroke], start: int, pull: int, breakout: str
+) -> bool:
+    """7B: 三买回抽不能离中枢太远 (czsc ``cxt_third_buy_V230228`` 的 tb_price 条件)。
+
+    三买: 回抽低点 < 区间最低点 + 1.618 × 关键向上笔幅度均值;
+    关键向上笔 = 中枢起点以来首个向上笔 + 之后每个创新高的向上笔。三卖镜像。
+    区间 = 中枢首笔至回抽笔。
+    """
+    window = strokes[start : pull + 1]
+    keys: list[Stroke] = []
+    for st in window[:-1]:
+        if st.direction != breakout:
+            continue
+        if not keys or (
+            _stroke_high(st) > _stroke_high(keys[-1])
+            if breakout == "up"
+            else _stroke_low(st) < _stroke_low(keys[-1])
+        ):
+            keys.append(st)
+    if not keys:
+        return False
+    reach = _THIRD_POINT_REACH * _mean([k.amplitude for k in keys])
+    if breakout == "up":
+        return strokes[pull].end.price < min(_stroke_low(st) for st in window) + reach
+    return strokes[pull].end.price > max(_stroke_high(st) for st in window) - reach
 
 
 def build_signals(
@@ -1521,7 +1647,11 @@ def build_signals(
                     ),
                     None,
                 )
-                if pull is not None and strokes[pull].end.price > p.zg:
+                if (
+                    pull is not None
+                    and strokes[pull].end.price > p.zg
+                    and _third_point_within_reach(strokes, p.start_index, pull, "up")
+                ):
                     signals.append(
                         ChanSignal(
                             kind="b3",
@@ -1549,7 +1679,11 @@ def build_signals(
                     ),
                     None,
                 )
-                if pull is not None and strokes[pull].end.price < p.zd:
+                if (
+                    pull is not None
+                    and strokes[pull].end.price < p.zd
+                    and _third_point_within_reach(strokes, p.start_index, pull, "down")
+                ):
                     signals.append(
                         ChanSignal(
                             kind="s3",
@@ -1569,6 +1703,37 @@ def build_signals(
                     )
                 break
 
+    # ── 结构一买 / 结构一卖 (4C: czsc cxt_first_buy_V221126) ───────────
+    # 不看中枢: 最近 21/19/.../5 笔构成下行 (上行) 结构且末笔力度衰减。
+    # 与上面的趋势一买并列输出, 两套口径互不替代。
+    for i in range(n):
+        cur = strokes[i]
+        for size in _FIRST_POINT_WINDOWS:
+            if i - size + 1 < 0:
+                continue
+            window = strokes[i - size + 1 : i + 1]
+            if not _check_first_point(window, cur.direction):
+                continue
+            is_buy = cur.direction == "down"
+            signals.append(
+                ChanSignal(
+                    kind="b1s" if is_buy else "s1s",
+                    label="结构一买" if is_buy else "结构一卖",
+                    date=cur.end.date,
+                    price=cur.end.price,
+                    bar_index=cur.end.bar_index,
+                    confirmed_date=cur.confirmed_date,
+                    level=params.level,
+                    detail={
+                        "rule": "czsc 结构一买: 下行结构末笔力度衰减"
+                        if is_buy
+                        else "czsc 结构一卖: 上行结构末笔力度衰减",
+                        "window_strokes": size,
+                    },
+                )
+            )
+            break
+
     # 去重: 同一位置同一类型只保留一条 (不同中枢可能指向同一次突破/回抽)
     unique: dict[tuple[str, str], ChanSignal] = {}
     for sig in signals:
@@ -1580,6 +1745,50 @@ def build_signals(
 # ================================================================
 # 主入口
 # ================================================================
+
+
+def _attach_volumes(
+    strokes: list[Stroke],
+    segments: list[Segment],
+    merged: Sequence[MergedBar],
+    dates: Sequence[str],
+    volumes: Sequence[float],
+) -> tuple[list[Stroke], list[Segment]]:
+    """给笔 / 线段填成交量 (背驰的成交量力度口径)。
+
+    笔: czsc ``get_power_volume`` = 笔合并 K 去掉首尾 (两端分型的外侧 K) 后的成交量,
+    即起点分型中间合并 K 至终点分型中间合并 K 覆盖的原始 K 线成交量之和。
+    段: 段起点至段终点 (极值点) 的原始 K 线成交量之和。
+    """
+    prefix = [0.0]
+    for v in volumes:
+        prefix.append(prefix[-1] + float(v or 0.0))
+
+    def _sum(lo: int, hi: int) -> float:
+        return prefix[hi + 1] - prefix[lo] if hi >= lo else 0.0
+
+    strokes = [
+        replace(
+            st,
+            volume=_sum(
+                merged[st.start.merged_index].start_index,
+                merged[st.end.merged_index].end_index,
+            ),
+        )
+        for st in strokes
+    ]
+    date_index = {d: i for i, d in enumerate(dates)}
+    segments = [
+        replace(
+            seg,
+            volume=_sum(
+                strokes[seg.start_index].start.bar_index,
+                date_index.get(seg.end_date, strokes[seg.start_index].start.bar_index),
+            ),
+        )
+        for seg in segments
+    ]
+    return strokes, segments
 
 
 def analyze(
@@ -1607,6 +1816,11 @@ def analyze(
     fractals = find_fractals(merged, params)
     strokes = build_strokes(fractals, params)
     segments = build_segments(strokes, params)
+    has_volume = "volume" in bars.columns
+    if has_volume:
+        strokes, segments = _attach_volumes(
+            strokes, segments, merged, series.dates, bars["volume"].fill_null(0).to_list()
+        )
     pivots = build_pivots(strokes, params)
     trend = classify_trend(pivots, strokes)
     divergences = detect_bi_divergence(strokes, params)
@@ -1627,6 +1841,8 @@ def analyze(
         warnings.append("未构成任何笔")
     if series.adj_factor_missing:
         warnings.append("adj_factor_missing: 无复权因子数据, 已退化为原始价")
+    if not has_volume:
+        warnings.append("volume_missing: 无成交量数据, 背驰只按价差与长度判定")
 
     return ChanStructure(
         symbol=symbol,

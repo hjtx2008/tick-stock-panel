@@ -43,7 +43,7 @@ from app.custom.chan.core import ChanLevel, ChanParams, analyze
 
 logger = logging.getLogger(__name__)
 
-VALID_SIGNAL_KINDS = ("b1", "b2", "b3", "s1", "s2", "s3")
+VALID_SIGNAL_KINDS = ("b1", "b2", "b3", "s1", "s2", "s3", "b1s", "s1s")
 VALID_TRENDS = ("up", "down", "oscillation")
 VALID_SCOPES = ("trend", "consolidation")
 
@@ -61,7 +61,7 @@ class ChanScreenConditions:
     """筛选条件 (全部为「与」关系; 留空 = 该维度不限)。"""
 
     signal_kinds: tuple[str, ...] = ()
-    """命中的买卖点类型 (b1/b2/b3/s1/s2/s3)。空 = 不限。"""
+    """命中的买卖点类型 (b1/b2/b3/s1/s2/s3, 结构一买卖 b1s/s1s)。空 = 不限。"""
 
     trend: tuple[str, ...] = ()
     """走势方向 (up/down/oscillation)。空 = 不限。"""
@@ -148,7 +148,7 @@ def build_qfq_frame(
 
     ``bars`` 需含 ``symbol`` / ``date`` / ``raw_high`` / ``raw_low`` / ``raw_close``。
     返回列: ``symbol`` / ``date`` / ``high`` / ``low`` / ``close`` (前复权) /
-    ``close_raw`` (原始收盘价, 供选股列表显示现价)。
+    ``close_raw`` (原始收盘价, 供选股列表显示现价) / ``volume`` (成交量, 背驰力度用; 缺列为空)。
     """
     if bars is None or bars.is_empty():
         raise ValueError("bars 为空")
@@ -160,6 +160,9 @@ def build_qfq_frame(
             pl.col("raw_high").alias("high"),
             pl.col("raw_low").alias("low"),
             pl.col("raw_close").alias("close_raw"),
+            (pl.col("volume") if "volume" in bars.columns else pl.lit(None, pl.Float64)).alias(
+                "volume"
+            ),
         ]
     ).sort(["symbol", "date"])
 
@@ -205,6 +208,7 @@ def build_qfq_frame(
             pl.col("low_adj").alias("low"),
             pl.col("close_adj").alias("close"),
             "close_raw",
+            "volume",
         ]
     ).sort(["symbol", "date"])
 
@@ -267,9 +271,10 @@ def _scan_symbols(bars: pl.DataFrame) -> list[dict]:
         g = g.sort("date")
         close_raw = float(g["close_raw"][-1])
         try:
-            structure = analyze(
-                g.select(["date", "high", "low", "close"]), params, symbol=symbol
-            )
+            cols = ["date", "high", "low", "close"]
+            if "volume" in g.columns and g["volume"].null_count() < g.height:
+                cols.append("volume")  # 全空 = 无成交量数据, 不传 (core 会告警并降级)
+            structure = analyze(g.select(cols), params, symbol=symbol)
         except ValueError:
             # 数据不足等 → 跳过该标的 (不返回空结构冒充成功)
             continue
@@ -501,7 +506,10 @@ def scan_market(repo, query: ChanScreenQuery) -> dict:
 
     lf = scan_enriched_parquet(files)
     bars = (
-        lf.select(["symbol", "date", "raw_high", "raw_low", "raw_close"])
+        lf.select(
+            ["symbol", "date", "raw_high", "raw_low", "raw_close"]
+            + (["volume"] if "volume" in lf.collect_schema().names() else [])
+        )
         .collect()
         .sort(["symbol", "date"])
     )

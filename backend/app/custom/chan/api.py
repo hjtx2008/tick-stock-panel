@@ -76,7 +76,7 @@ def _load_bars(repo, symbol: str, days: int) -> tuple[pl.DataFrame, str]:
         end = repo.enriched_latest_date() or date.today()
         start = end - timedelta(days=int(days * _CALENDAR_PER_TRADING_DAY) + 30)
 
-    wanted = ["date", "raw_high", "raw_low", "raw_close", "high", "low", "close"]
+    wanted = ["date", "raw_high", "raw_low", "raw_close", "high", "low", "close", "volume"]
     df = repo.get_daily_asset(asset_type, symbol, start, end, columns=wanted)
     if df is None or df.is_empty():
         raise HTTPException(status_code=404, detail=f"没有 {symbol} 的日 K 数据")
@@ -93,7 +93,9 @@ def _load_bars(repo, symbol: str, days: int) -> tuple[pl.DataFrame, str]:
                 pl.col("close").alias("raw_close"),
             ]
         )
-    df = df.select("date", "raw_high", "raw_low", "raw_close").sort("date")
+    # volume: 背驰的成交量力度 (czsc 口径); 缺列时 core 只按价差与长度判定并给出告警
+    keep = ["date", "raw_high", "raw_low", "raw_close"] + (["volume"] if "volume" in have else [])
+    df = df.select(keep).sort("date")
     # days 是**交易日数**: 日历窗口只是取数范围, 这里裁剪到最近 N 个交易日
     if df.height > days:
         df = df.tail(days)
