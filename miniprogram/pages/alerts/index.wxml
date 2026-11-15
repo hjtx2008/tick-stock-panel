@@ -1,0 +1,33 @@
+<view class="toolbar">
+  <text>近 {{days}} 天 · {{alerts.length}} 条</text>
+  <text>{{trading ? '盘中 · 每 10 秒刷新' : '下拉刷新'}}</text>
+</view>
+
+<view wx:if="{{error && !alerts.length}}" class="status error">{{error}}</view>
+<view wx:elif="{{loading && !alerts.length}}" class="status">加载中…</view>
+<view wx:elif="{{!alerts.length}}" class="status">近 {{days}} 天没有告警</view>
+
+<view wx:else class="panel">
+  <view
+    wx:for="{{alerts}}"
+    wx:key="key"
+    class="row"
+    data-symbol="{{item.symbol}}"
+    data-name="{{item.name}}"
+    bindtap="onOpen"
+  >
+    <view class="row-main">
+      <view class="row-title">
+        <text wx:if="{{item.name || item.symbol}}">{{item.name || item.symbol}} </text>
+        <text class="row-sub">{{item.ruleName}}</text>
+      </view>
+      <view class="row-sub msg">{{item.message}}</view>
+    </view>
+    <view class="row-right">
+      <view class="mono small muted">{{item.timeText}}</view>
+      <view class="mono">{{item.priceText}}</view>
+    </view>
+  </view>
+</view>
+
+<view wx:if="{{error && alerts.length}}" class="toolbar"><text class="up">刷新失败: {{error}} (显示上一次数据)</text></view>

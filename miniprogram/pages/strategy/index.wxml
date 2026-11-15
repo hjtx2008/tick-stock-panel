@@ -1,0 +1,29 @@
+<view class="toolbar">
+  <text>{{asOf ? '数据日 ' + asOf : ''}}</text>
+  <text>命中 {{rows.length}} 只</text>
+</view>
+
+<view wx:if="{{error && !rows.length}}" class="status error">{{error}}</view>
+<view wx:elif="{{loading && !rows.length}}" class="status">加载中…</view>
+<view wx:elif="{{empty}}" class="status">该策略今天还没有结果, 请在「选股」页运行。</view>
+<view wx:elif="{{!rows.length}}" class="status">今天没有命中的股票</view>
+
+<view wx:else class="panel">
+  <view
+    wx:for="{{rows}}"
+    wx:key="symbol"
+    class="row"
+    data-symbol="{{item.symbol}}"
+    data-name="{{item.name}}"
+    bindtap="onOpen"
+  >
+    <view class="row-main">
+      <view class="row-title">{{item.name || item.symbol}}</view>
+      <view class="row-sub mono">{{item.symbol}}{{item.scoreText ? ' · 评分 ' + item.scoreText : ''}}</view>
+    </view>
+    <view class="row-right">
+      <view class="mono {{item.color}}">{{item.priceText}}</view>
+      <view class="mono {{item.color}} small">{{item.pctText}}</view>
+    </view>
+  </view>
+</view>

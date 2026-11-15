@@ -1,0 +1,2 @@
+.msg { line-height: 1.5; }
+.small { font-size: 22rpx; margin-bottom: 6rpx; }

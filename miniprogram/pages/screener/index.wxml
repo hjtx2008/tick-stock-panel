@@ -1,0 +1,36 @@
+<view class="toolbar">
+  <text>{{asOf ? '数据日 ' + asOf : '今日尚未运行'}}</text>
+  <text wx:if="{{pendingCount}}">后台计算中 · 剩余 {{pendingCount}} 个</text>
+</view>
+
+<view class="actions">
+  <view class="btn {{running ? 'disabled' : ''}}" bindtap="onRunAll">{{running ? '运行中…' : '运行全部策略'}}</view>
+</view>
+
+<view wx:if="{{error && !items.length}}" class="status error">{{error}}</view>
+<view wx:elif="{{loading && !items.length}}" class="status">加载中…</view>
+<view wx:elif="{{!items.length}}" class="status">没有可用的策略</view>
+
+<view wx:else class="panel">
+  <view
+    wx:for="{{items}}"
+    wx:key="id"
+    class="row"
+    data-id="{{item.id}}"
+    data-name="{{item.name}}"
+    bindtap="onOpen"
+  >
+    <view class="row-main">
+      <view class="row-title">{{item.name}}</view>
+      <view class="row-sub">{{item.sub}}</view>
+    </view>
+    <view class="row-right">
+      <text wx:if="{{item.error}}" class="up">失败</text>
+      <text wx:elif="{{item.pending}}" class="muted">计算中</text>
+      <text wx:elif="{{item.total === null}}" class="muted">—</text>
+      <text wx:else class="count mono">{{item.total}}</text>
+    </view>
+  </view>
+</view>
+
+<view wx:if="{{error && items.length}}" class="toolbar"><text class="up">{{error}}</text></view>

@@ -1,0 +1,27 @@
+.kchart {
+  position: relative;
+  width: 100%;
+}
+.kc-canvas {
+  width: 100%;
+  display: block;
+}
+.kc-tip {
+  position: absolute;
+  left: 12rpx;
+  top: 8rpx;
+  font-size: 20rpx;
+  color: #e6e8eb;
+  background: rgba(15, 17, 21, 0.85);
+  padding: 4rpx 12rpx;
+  border-radius: 8rpx;
+  pointer-events: none;
+}
+.kc-empty {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 45%;
+  text-align: center;
+  color: #8a8f98;
+}

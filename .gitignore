@@ -112,3 +112,5 @@ reports/cursor_tickflow_pro_rate_limit_p0.bundle
 
 # Codex 部署备忘(暂缓推送)
 MEMO-push-paused.md
+# 微信开发者工具的个人本地设置 (每台机器不同)
+miniprogram/project.private.config.json

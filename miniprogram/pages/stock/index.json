@@ -1,0 +1,7 @@
+{
+  "navigationBarTitleText": "个股",
+  "enablePullDownRefresh": true,
+  "usingComponents": {
+    "kchart": "/components/kchart/index"
+  }
+}

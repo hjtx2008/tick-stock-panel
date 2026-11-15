@@ -1,0 +1,17 @@
+.head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  padding: 24rpx 28rpx 0;
+}
+.name { font-size: 36rpx; margin-right: 12rpx; }
+.code { font-size: 24rpx; }
+.quote { text-align: right; }
+.last-price { font-size: 36rpx; margin-right: 12rpx; }
+.chips { padding-top: 20rpx; }
+.chart-panel { padding: 8rpx 0 12rpx; }
+.legend { font-size: 20rpx; padding: 6rpx 20rpx 0; }
+.legend text { margin-right: 16rpx; }
+.lg-stroke { color: #d9b65a; }
+.lg-seg { color: #5aa9e6; }
+.lg-pivot { color: #a78bfa; }

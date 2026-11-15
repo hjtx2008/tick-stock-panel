@@ -1,0 +1,30 @@
+<view class="toolbar">
+  <text>{{asOf ? '数据日 ' + asOf : ''}}</text>
+  <text>{{trading ? '盘中 · 每 5 秒刷新' : '非交易时段 · 下拉刷新'}}</text>
+</view>
+
+<view wx:if="{{error && !rows.length}}" class="status error">{{error}}</view>
+<view wx:elif="{{loading && !rows.length}}" class="status">加载中…</view>
+<view wx:elif="{{!rows.length}}" class="status">自选为空。请在网页端添加自选股。</view>
+
+<view wx:else class="panel">
+  <view
+    wx:for="{{rows}}"
+    wx:key="symbol"
+    class="row"
+    data-symbol="{{item.symbol}}"
+    data-name="{{item.name}}"
+    bindtap="onOpen"
+  >
+    <view class="row-main">
+      <view class="row-title">{{item.name || item.symbol}}</view>
+      <view class="row-sub mono">{{item.symbol}} · 成交额 {{item.amountText}}</view>
+    </view>
+    <view class="row-right">
+      <view class="price mono {{item.color}}">{{item.priceText}}</view>
+      <view class="pct mono {{item.color}}">{{item.pctText}}</view>
+    </view>
+  </view>
+</view>
+
+<view wx:if="{{error && rows.length}}" class="toolbar"><text class="up">刷新失败: {{error}} (显示上一次数据)</text></view>

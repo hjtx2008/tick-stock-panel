@@ -1,0 +1,13 @@
+.field { padding: 24rpx 28rpx; }
+.label { font-size: 26rpx; margin-bottom: 12rpx; }
+.input {
+  background: #0f1115;
+  border: 1rpx solid #262a33;
+  border-radius: 10rpx;
+  padding: 16rpx 20rpx;
+  font-size: 28rpx;
+  color: #e6e8eb;
+}
+.hint { font-size: 22rpx; color: #8a8f98; margin-top: 12rpx; line-height: 1.5; }
+.actions { padding: 0 28rpx 28rpx; }
+.footnote { padding: 24rpx 36rpx; font-size: 22rpx; line-height: 1.6; }

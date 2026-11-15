@@ -1,0 +1,44 @@
+{
+  "description": "Tick Stock Panel 手机端 (微信小程序, 局域网自用)",
+  "compileType": "miniprogram",
+  "miniprogramRoot": "",
+  "projectname": "tick-stock-panel-mp",
+  "appid": "wx67cabf59f50b281d",
+  "libVersion": "3.3.4",
+  "setting": {
+    "urlCheck": false,
+    "es6": true,
+    "enhance": true,
+    "postcss": true,
+    "minified": true,
+    "showShadowRootInWxmlPanel": true,
+    "compileWorklet": false,
+    "uglifyFileName": false,
+    "uploadWithSourceMap": true,
+    "packNpmManually": false,
+    "packNpmRelationList": [],
+    "minifyWXSS": true,
+    "minifyWXML": true,
+    "localPlugins": false,
+    "disableUseStrict": false,
+    "useCompilerPlugins": false,
+    "condition": false,
+    "babelSetting": {
+      "ignore": [],
+      "disablePlugins": [],
+      "outputPath": ""
+    }
+  },
+  "packOptions": {
+    "ignore": [
+      {
+        "value": "README.md",
+        "type": "file"
+      }
+    ],
+    "include": []
+  },
+  "condition": {},
+  "simulatorPluginLibVersion": {},
+  "editorSetting": {}
+}

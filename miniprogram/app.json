@@ -1,0 +1,34 @@
+{
+  "pages": [
+    "pages/watchlist/index",
+    "pages/screener/index",
+    "pages/chan/index",
+    "pages/alerts/index",
+    "pages/settings/index",
+    "pages/stock/index",
+    "pages/strategy/index"
+  ],
+  "window": {
+    "navigationBarTitleText": "Tick Stock Panel",
+    "navigationBarBackgroundColor": "#14161c",
+    "navigationBarTextStyle": "white",
+    "backgroundColor": "#0f1115",
+    "backgroundTextStyle": "light"
+  },
+  "tabBar": {
+    "color": "#8a8f98",
+    "selectedColor": "#a78bfa",
+    "backgroundColor": "#14161c",
+    "borderStyle": "black",
+    "list": [
+      { "pagePath": "pages/watchlist/index", "text": "自选" },
+      { "pagePath": "pages/screener/index", "text": "选股" },
+      { "pagePath": "pages/chan/index", "text": "缠论" },
+      { "pagePath": "pages/alerts/index", "text": "告警" },
+      { "pagePath": "pages/settings/index", "text": "设置" }
+    ]
+  },
+  "style": "v2",
+  "sitemapLocation": "sitemap.json",
+  "lazyCodeLoading": "requiredComponents"
+}

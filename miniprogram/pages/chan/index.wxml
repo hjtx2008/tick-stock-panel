@@ -1,0 +1,58 @@
+<view class="panel filters">
+  <view class="label">买卖点 (任一命中)</view>
+  <view>
+    <text
+      wx:for="{{kinds}}"
+      wx:key="value"
+      class="chip {{item.active ? 'active' : ''}}"
+      data-value="{{item.value}}"
+      bindtap="onToggleKind"
+    >{{item.label}}</text>
+  </view>
+  <view class="label">信号距今</view>
+  <view>
+    <text
+      wx:for="{{ages}}"
+      wx:key="value"
+      class="chip {{maxAge === item.value ? 'active' : ''}}"
+      data-value="{{item.value}}"
+      bindtap="onAge"
+    >{{item.label}}</text>
+  </view>
+  <view class="actions">
+    <view class="btn {{running ? 'disabled' : ''}}" bindtap="onRun">{{running ? '全市场扫描中…' : '开始扫描'}}</view>
+  </view>
+</view>
+
+<view wx:if="{{error}}" class="status error">{{error}}</view>
+<view wx:elif="{{ran && !matches.length}}" class="status">没有符合条件的股票</view>
+
+<view wx:if="{{ran && matches.length}}" class="toolbar">
+  <text>扫描 {{scanned}} 只 · 命中 {{totalMatched}} 只{{totalMatched > matches.length ? ' (显示前 ' + matches.length + ')' : ''}}</text>
+  <text>{{elapsedText}}</text>
+</view>
+
+<view wx:if="{{matches.length}}" class="panel">
+  <view
+    wx:for="{{matches}}"
+    wx:key="symbol"
+    class="row"
+    data-symbol="{{item.symbol}}"
+    data-name="{{item.name}}"
+    bindtap="onOpen"
+  >
+    <view class="row-main">
+      <view class="row-title">{{item.name || item.symbol}}</view>
+      <view class="row-sub">
+        <text class="mono">{{item.symbol}}</text>
+        <text> · {{item.trendText}}</text>
+      </view>
+    </view>
+    <view class="row-right">
+      <view wx:if="{{item.signal}}">
+        <text class="tag {{item.signal.buy ? 'buy' : 'sell'}}">{{item.signal.label}}</text>
+      </view>
+      <view class="row-sub mono">{{item.signal ? item.signal.date : ''}} {{item.closeText}}</view>
+    </view>
+  </view>
+</view>

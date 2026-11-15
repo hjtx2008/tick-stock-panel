@@ -1,0 +1,3 @@
+.filters { padding: 20rpx 24rpx 0; }
+.label { font-size: 24rpx; color: #8a8f98; margin: 8rpx 0 12rpx; }
+.actions { padding: 12rpx 0 24rpx; }

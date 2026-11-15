@@ -1,0 +1,47 @@
+<view class="panel">
+  <view class="field">
+    <view class="label">后端地址</view>
+    <input
+      class="input mono"
+      value="{{baseUrl}}"
+      placeholder="http://192.168.1.10:3018"
+      bindinput="onBaseUrlInput"
+      confirm-type="done"
+      bindconfirm="onTest"
+    />
+    <view class="hint">填电脑在局域网里的 IP 和后端端口 (默认 3018)。手机要和电脑连同一个 Wi-Fi。</view>
+  </view>
+  <view class="actions">
+    <view class="btn" bindtap="onTest">保存并测试连接</view>
+  </view>
+</view>
+
+<view class="panel" wx:if="{{statusText}}">
+  <view class="row">
+    <view class="row-main">
+      <view class="row-title">连接状态</view>
+      <view class="row-sub {{statusError ? 'up' : ''}}">{{statusText}}</view>
+    </view>
+  </view>
+</view>
+
+<view class="panel" wx:if="{{configured && !authenticated}}">
+  <view class="field">
+    <view class="label">访问密码</view>
+    <input class="input" password value="{{password}}" placeholder="网页端设置的访问密码" bindinput="onPasswordInput" bindconfirm="onLogin" />
+  </view>
+  <view class="actions">
+    <view class="btn {{loggingIn ? 'disabled' : ''}}" bindtap="onLogin">{{loggingIn ? '登录中…' : '登录'}}</view>
+  </view>
+</view>
+
+<view class="panel" wx:if="{{configured && authenticated}}">
+  <view class="actions">
+    <view class="btn ghost" bindtap="onLogout">退出登录</view>
+  </view>
+</view>
+
+<view class="footnote muted">
+  本小程序只读取电脑上 Tick Stock Panel 后端的数据, 不提供投资建议。
+  开发者工具或真机调试时需要关闭「校验合法域名」, 详见 miniprogram/README.md。
+</view>

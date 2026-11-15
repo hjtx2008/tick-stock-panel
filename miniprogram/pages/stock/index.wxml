@@ -1,0 +1,49 @@
+<view class="head">
+  <view>
+    <text class="name">{{name || symbol}}</text>
+    <text class="code mono muted">{{symbol}}</text>
+  </view>
+  <view class="quote" wx:if="{{last}}">
+    <text class="mono {{last.color}} last-price">{{last.priceText}}</text>
+    <text class="mono {{last.color}}">{{last.pctText}}</text>
+  </view>
+</view>
+
+<view class="toolbar chips">
+  <view>
+    <text wx:for="{{windows}}" wx:key="*this" class="chip {{visible === item ? 'active' : ''}}" data-n="{{item}}" bindtap="onWindow">{{item}} 日</text>
+  </view>
+  <text class="chip {{showChan ? 'active' : ''}}" bindtap="onToggleChan">缠论</text>
+</view>
+
+<view wx:if="{{error && !bars.length}}" class="status error">{{error}}</view>
+<view wx:elif="{{loading && !bars.length}}" class="status">加载中…</view>
+<view wx:else class="panel chart-panel">
+  <kchart bars="{{bars}}" overlay="{{showChan ? overlay : null}}" visible="{{visible}}" height="{{chartHeight}}" />
+  <view class="legend muted">
+    <text class="lg-stroke">— 笔</text>
+    <text class="lg-seg">━ 线段</text>
+    <text class="lg-pivot">▭ 中枢</text>
+    <text>左右拖动查看历史, 点一下看当日价格</text>
+  </view>
+</view>
+
+<view wx:if="{{chanLoading}}" class="toolbar"><text>缠论结构计算中 (约 10~20 秒)…</text></view>
+<view wx:if="{{chanError}}" class="toolbar"><text class="up">缠论结构加载失败: {{chanError}}</text></view>
+
+<view wx:if="{{summary}}" class="panel">
+  <view class="row">
+    <view class="row-main">
+      <view class="row-title">缠论结构 · {{summary.trendText}}</view>
+      <view class="row-sub">笔 {{summary.strokes}} · 线段 {{summary.segments}} · 中枢 {{summary.pivots}} · 确认背驰 {{summary.divergences}}</view>
+    </view>
+  </view>
+  <view wx:if="{{!signals.length}}" class="row"><view class="row-sub">样本内没有买卖点</view></view>
+  <view wx:for="{{signals}}" wx:key="key" class="row">
+    <view class="row-main">
+      <text class="tag {{item.buy ? 'buy' : 'sell'}}">{{item.label}}</text>
+      <text class="mono">{{item.date}}</text>
+    </view>
+    <view class="row-right mono">{{item.priceText}}</view>
+  </view>
+</view>

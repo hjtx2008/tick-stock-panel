@@ -1,0 +1,2 @@
+.price { font-size: 32rpx; }
+.pct { font-size: 24rpx; margin-top: 6rpx; }

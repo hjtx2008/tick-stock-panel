@@ -1,0 +1,13 @@
+<view class="kchart" style="height: {{height}}px">
+  <canvas
+    type="2d"
+    id="kc"
+    class="kc-canvas"
+    style="height: {{height}}px"
+    bindtouchstart="onTouchStart"
+    bindtouchmove="onTouchMove"
+    bindtouchend="onTouchEnd"
+  ></canvas>
+  <view wx:if="{{tip}}" class="kc-tip mono">{{tip}}</view>
+  <view wx:if="{{!bars.length}}" class="kc-empty">暂无 K 线</view>
+</view>

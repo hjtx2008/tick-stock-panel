@@ -1,0 +1,2 @@
+.actions { padding: 20rpx 24rpx 0; }
+.count { font-size: 34rpx; color: #a78bfa; }
