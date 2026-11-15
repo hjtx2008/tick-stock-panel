@@ -43,7 +43,7 @@ def _is_local_network(host: str | None) -> bool:
     """是否本机或内网请求。
 
     反向代理(Nginx)场景下 request.client.host 是代理本身(127.0.0.1),
-    需信任 X-Forwarded-For 的最左(原始客户端)。本项目部署若经反代,
+    需信任 X-Forwarded-For 中反代追加的最右一项(见 _client_ip)。本项目部署若经反代,
     请在反代配置正确的 X-Forwarded-For(标准做法)。
     """
     if not host:
@@ -74,7 +74,11 @@ def _client_ip(request: Request) -> str:
     direct = request.client.host if request.client else ""
     xff = request.headers.get("x-forwarded-for")
     if xff and direct and _is_local_network(direct):
-        return xff.split(",")[0].strip()
+        # 取最右一项: 反代 (Nginx proxy_add_x_forwarded_for 等) 是把它看到的对端地址
+        # **追加**到客户端自带的 XFF 之后, 最左项由客户端任意填写, 不可信。
+        hops = [h.strip() for h in xff.split(",") if h.strip()]
+        if hops:
+            return hops[-1]
     return direct or "unknown"
 
 

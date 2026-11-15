@@ -52,3 +52,30 @@ async def test_default_probe_passes_on_healthy_resources() -> None:
     lock = threading.Lock()
     default_probe(lock)  # 不抛即通过
     default_probe(None)
+
+
+async def test_stop_during_probe_does_not_hang() -> None:
+    """stop() 落在探测进行中: 取消必须透传, 不能被当作探测失败吞掉后继续循环。"""
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def probe() -> None:
+        started.set()
+        release.wait(2.0)
+
+    wd = HealthWatchdog(
+        probe,
+        exit_cb=lambda _code: None,
+        interval_s=0.01,
+        probe_timeout_s=5.0,
+        failure_threshold=100,
+    )
+    wd.start()
+    while not started.is_set():
+        await asyncio.sleep(0.005)
+    try:
+        await asyncio.wait_for(wd.stop(), timeout=1.0)
+    finally:
+        release.set()
