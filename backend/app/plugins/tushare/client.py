@@ -34,7 +34,21 @@ BASE_URL = "https://api.tushare.pro"
 
 _PAGE_SIZE = 6000        # 单次返回上限(官方文档: 每次 6000 条)
 _MAX_PAGES = 500         # 分页保护: 单接口最多翻 500 页(=300 万行), 防御死循环
-_DEFAULT_INTERVAL_S = 0.15  # 请求节流: 约 400 次/分, 留出限频余量
+# 请求节流: Tushare 按接口限频, daily 实测上限 300 次/分 (超限返回 40203)。
+# 0.25s 间隔 = 240 次/分, 留出约 20% 余量; 0.15s(400次/分) 实测会被限频打断长任务。
+_DEFAULT_INTERVAL_S = 0.25
+
+# 网络瞬断重试: SSL EOF / 连接重置 / 超时 / 5xx 这类随机失败重试即可恢复。
+# Tushare 业务错误码 (积分不足/参数错) 不重试 —— 重试无意义还会白白消耗限频配额。
+_MAX_RETRIES = 3            # 额外重试次数 (总尝试 = _MAX_RETRIES + 1)
+_RETRY_BACKOFF_BASE = 0.5   # 首次退避秒数, 之后指数翻倍
+_RETRY_BACKOFF_CAP = 8.0    # 退避上限秒数
+
+# 限频 (40203) 是"等一会儿就好"的错误: 与积分/参数错误不同, 退避后重试可恢复。
+# 长任务 (全历史回补动辄上万次请求) 撞上限频若直接抛出会中途崩掉整个作业。
+_RATE_LIMIT_CODE = "40203"
+_RATE_LIMIT_RETRIES = 4         # 限频退避重试次数
+_RATE_LIMIT_BACKOFF_S = 30.0    # 首次退避秒数 (限频窗口为 1 分钟), 之后线性递增
 
 _DAILY_FIELDS = "ts_code,trade_date,open,high,low,close,vol,amount"
 _ADJ_FACTOR_FIELDS = "ts_code,trade_date,adj_factor"
@@ -69,6 +83,24 @@ _MAX_HALVE_DEPTH = 3
 
 class TushareError(Exception):
     """Tushare 接口错误(配置缺失 / 网络失败 / 信封 code != 0)。"""
+
+
+class _RateLimitError(Exception):
+    """内部信号: 命中 Tushare 限频 (code=40203), 由 _post 退避重试后转成 TushareError。"""
+
+
+_RATE_LIMIT_MSG_MARKERS = ("每分钟", "每小时", "每天", "最多访问", "频率", "次数")
+
+
+def _is_permission_denied(msg: str) -> bool:
+    """40203 同时用于限频与「无接口权限」; 权限不足等多久都不会恢复, 不能进限频退避。
+
+    限频文案本身也带「权限」二字 (「您每分钟最多访问该接口N次，权限的具体详情访问…」),
+    故先看频次字样: 有 → 限频; 无频次字样但提到权限 → 权限不足。
+    """
+    if any(marker in msg for marker in _RATE_LIMIT_MSG_MARKERS):
+        return False
+    return "权限" in msg
 
 
 def _yyyymmdd(d: date) -> str:
@@ -119,21 +151,69 @@ class TushareClient:
         self._last_call = time.monotonic()
 
     def _post(self, body: dict) -> dict:
-        self._throttle()
-        try:
-            resp = self._http.post("/", json=body)
-        except httpx.HTTPError as e:
-            raise TushareError(f"网络请求失败: {e}") from e
-        if resp.status_code != 200:
-            raise TushareError(f"HTTP {resp.status_code}")
-        try:
-            payload = resp.json()
-        except ValueError as e:
-            raise TushareError(f"响应不是 JSON: {e}") from e
-        code = payload.get("code")
-        if code not in (0, "0", None):
-            raise TushareError(f"Tushare 接口错误 code={code}: {payload.get('msg') or ''}")
-        return payload
+        """POST 一次并解析响应, 限频错误退避重试。
+
+        网络层瞬断 (SSL EOF / 连接重置 / 超时 / 5xx) 用指数退避重试 —— 这类失败
+        是随机的, 重试即可恢复; 而 Tushare 业务错误码 (积分不足/参数错) 重试无意义,
+        直接抛出让上层按失败率判定。
+        限频 (40203) 是例外: 等过限频窗口即可恢复, 故单独退避重试, 避免上万次请求
+        的长任务被一次限频打断。
+        """
+        rate_hits = 0
+        while True:
+            try:
+                return self._post_once(body)
+            except _RateLimitError as e:
+                rate_hits += 1
+                if rate_hits > _RATE_LIMIT_RETRIES:
+                    raise TushareError(
+                        f"Tushare 接口错误 code={_RATE_LIMIT_CODE}: {e} "
+                        f"(退避重试 {_RATE_LIMIT_RETRIES} 次后仍超限)"
+                    ) from e
+                delay = _RATE_LIMIT_BACKOFF_S * rate_hits
+                logger.warning(
+                    "Tushare 触发限频 (code=%s), 等待 %.0fs 后重试 (%d/%d)",
+                    _RATE_LIMIT_CODE, delay, rate_hits, _RATE_LIMIT_RETRIES,
+                )
+                time.sleep(delay)
+
+    def _post_once(self, body: dict) -> dict:
+        """单次 POST + 信封解析 (网络瞬断按指数退避重试)。"""
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES + 1):
+            if attempt:
+                # 退避: 0.5s, 1s, 2s ... 最多 _RETRY_BACKOFF_CAP 秒
+                delay = min(_RETRY_BACKOFF_CAP, _RETRY_BACKOFF_BASE * (2 ** (attempt - 1)))
+                logger.warning(
+                    "Tushare 请求失败, 第 %d/%d 次重试 (等待 %.1fs): %s",
+                    attempt, _MAX_RETRIES, delay, last_exc,
+                )
+                time.sleep(delay)
+            self._throttle()
+            try:
+                resp = self._http.post("/", json=body)
+            except httpx.HTTPError as e:
+                last_exc = e
+                continue
+            if resp.status_code >= 500:
+                last_exc = TushareError(f"HTTP {resp.status_code}")
+                continue
+            if resp.status_code != 200:
+                raise TushareError(f"HTTP {resp.status_code}")
+            try:
+                payload = resp.json()
+            except ValueError as e:
+                last_exc = TushareError(f"响应不是 JSON: {e}")
+                continue
+            code = payload.get("code")
+            if code not in (0, "0", None):
+                msg = str(payload.get("msg") or "")
+                if str(code) == _RATE_LIMIT_CODE and not _is_permission_denied(msg):
+                    raise _RateLimitError(msg)
+                # 业务错误 (积分/参数): 重试无用, 立即抛出
+                raise TushareError(f"Tushare 接口错误 code={code}: {msg}")
+            return payload
+        raise TushareError(f"网络请求失败 (重试 {_MAX_RETRIES} 次后仍失败): {last_exc}")
 
     def query(self, api_name: str, params: dict | None = None, fields: str = "") -> list[dict]:
         """单次查询 → dict 列表 (fields + items 组装)。无数据时返回空列表。"""

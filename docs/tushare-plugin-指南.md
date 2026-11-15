@@ -94,15 +94,28 @@ financial  → columns: symbol, period_end, announce_date, roe, roa, gross_margi
 - **全市场同步走「按交易日取数」**：单次请求上限 6000 行，全市场约 5400 只，一天一次请求就能拉完。一年历史 ≈ 243 次请求；而按 `ts_code` 逐只拉需要 5000+ 次。
 - **标的数 < 100 时自动切回逐标的模式**，避免为几只股票拉回全市场再丢弃。
 - **交易日历不可用时自动回退**逐标的模式（不会整体失败）。
-- 请求默认节流 0.15s（约 400 次/分），留出限频余量。你 2000 积分档完全够用（`daily` / `adj_factor` 各需 120 积分）。
+- 请求默认节流 **0.25s**（约 240 次/分）。Tushare 对 `daily` 接口硬限频 **300 次/分钟**，超限返回 `code=40203`；0.15s（400 次/分）实测会被限频打断长任务，故下调到 0.25s 留约 20% 余量。你 2000 积分档完全够用（`daily` / `adj_factor` 各需 120 积分）。
+- **命中限频自动退避重试**：`40203` 按 30/60/90/120 秒退避，最多 4 次；积分不足等业务错误（`40201` 等）**不重试**，直接抛出。
 - **财务三表是逐只的**，节流 0.08s，全市场三表合计约 16650 次请求 ≈ 25~30 分钟（后台线程跑，前端轮询进度）。
   首装是 `latest_only=False`（每只补 8 期），之后增量只拉最新一期。
 - 若你更看重速度，可以只把**财务**留给 fuyao、日K/除权因子走 Tushare —— 两者可以在设置页分别切换。
+
+### 全市场口径（含已退市代码）
+
+`POST /api/kline/extend_history` 请求体加 `{"include_all_market": true}` 即可切到**全市场口径**：
+
+- 常规模式只返回请求标的集合内的代码；全市场模式**不做标的过滤**，已退市代码的历史一并落库。
+- 请求集合此时只用于决定取数模式（是否达到全市场按日阈值 100 只），不影响返回内容。
+- 未实现该可选参数的 provider 会被自动忽略，按默认语义执行，保持兼容。
+
+实测（2026-11 全历史回补）：**5,925 标的 / 18,438,267 行 / 1990-12-19 ~ 2026-11-13**，含 33 只已退市代码；
+`kline_daily` 427 MB、`kline_daily_enriched` 1051 MB、`adj_factor` 64,688 事件行。耗时 116 分钟。
 
 ## 五、失败处理
 
 - 个别日期/标的失败 → 只告警，继续
 - **失败过半 → 直接抛错中止**，避免半截数据落库（资金流向面板曾因此吃过亏）
+- **接口限频（`40203`）→ 不算失败**，按 30/60/90/120 秒退避重试（最多 4 次）后仍超限才报错；全历史回补期间实测触发 13 次，全部自动恢复，作业未中断。
 
 ---
 
@@ -115,7 +128,7 @@ backend/app/plugins/tushare/
 ├── client.py      # HTTP: 鉴权、信封解包、分页、节流
 └── provider.py    # 契约: 单位换算、字段映射、取数模式、test_dataset
 
-backend/tests/test_tushare_provider.py    # 34 个契约测试（daily / adj_factor）
+backend/tests/test_tushare_provider.py    # 43 个契约测试（daily / adj_factor / 限频退避 / 全市场口径）
 backend/tests/test_tushare_financial.py   # 18 个契约测试（财务：单位、去重、批量上限、失败率）
 ```
 
@@ -124,7 +137,7 @@ backend/tests/test_tushare_financial.py   # 18 个契约测试（财务：单位
 ## 七、验证结果
 
 - `ruff check` — 全通过
-- `pytest tests/test_tushare_provider.py tests/test_tushare_financial.py` — **52 passed**
+- `pytest tests/test_tushare_provider.py tests/test_tushare_financial.py` — **61 passed**（43 + 18）
 - 回归 fuyao / custom / preferences / settings 相关用例 — **112 passed**，现有数据源不受影响
 - 真实接口冒烟（已验证）：metrics 3 只、income 2 只、shares 全市场抽样均返回正确数值
   （茅台 2026H1 营收 907.03 亿 / 归母 445.17 亿 / 总股本 12.501 亿股，与公开数据一致）

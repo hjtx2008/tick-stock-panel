@@ -139,6 +139,11 @@ def _factor_row(code, day, factor):
     return {"ts_code": code, "trade_date": day, "adj_factor": factor}
 
 
+def _wide_universe(*extra: str) -> list[str]:
+    """>= _DATE_MODE_MIN_SYMBOLS 的请求标的集 — 才能走"按交易日取全市场"模式。"""
+    return [f"{i:06d}.SZ" for i in range(tp._DATE_MODE_MIN_SYMBOLS + 5)] + list(extra)
+
+
 # ---- 单位口径 ----
 
 
@@ -576,8 +581,6 @@ def test_client_envelope_error_code(monkeypatch):
     """信封 code != 0 必须抛错, 不能把错误响应当空数据处理。"""
     import httpx
 
-    from app.plugins.tushare.client import TushareClient
-
     def _fake_post(self, *a, **kw):
         class _Resp:
             status_code = 200
@@ -589,7 +592,9 @@ def test_client_envelope_error_code(monkeypatch):
         return _Resp()
 
     monkeypatch.setattr(httpx.Client, "post", _fake_post)
-    client = TushareClient(api_key="k", interval=0.0)
+    # 40203 走限频退避重试 (30s 起线性递增), 不 patch 会真实 sleep 约 5 分钟
+    monkeypatch.setattr("app.plugins.tushare.client.time.sleep", lambda _s: None)
+    client = tc.TushareClient(api_key="k", interval=0.0)
     with pytest.raises(tc.TushareError, match="40203"):
         client.query("daily", {"trade_date": "20240102"})
     client.close()
@@ -598,8 +603,6 @@ def test_client_envelope_error_code(monkeypatch):
 def test_client_assembles_fields_and_items(monkeypatch):
     """响应为 列名 + 二维行分离的结构, 必须正确组装成 dict 列表。"""
     import httpx
-
-    from app.plugins.tushare.client import TushareClient
 
     def _fake_post(self, *a, **kw):
         class _Resp:
@@ -619,7 +622,7 @@ def test_client_assembles_fields_and_items(monkeypatch):
         return _Resp()
 
     monkeypatch.setattr(httpx.Client, "post", _fake_post)
-    client = TushareClient(api_key="k", interval=0.0)
+    client = tc.TushareClient(api_key="k", interval=0.0)
     rows = client.query("daily", {"trade_date": "20240102"})
     assert rows == [{"ts_code": "000001.SZ", "trade_date": "20240102", "close": 10.2}]
     client.close()
@@ -628,8 +631,6 @@ def test_client_assembles_fields_and_items(monkeypatch):
 def test_client_pagination_stops_on_short_page(monkeypatch):
     """末页不足 _PAGE_SIZE 即停, 不空转。"""
     import httpx
-
-    from app.plugins.tushare.client import TushareClient
 
     calls = []
 
@@ -653,8 +654,264 @@ def test_client_pagination_stops_on_short_page(monkeypatch):
         return _Resp()
 
     monkeypatch.setattr(httpx.Client, "post", _fake_post)
-    client = TushareClient(api_key="k", interval=0.0)
+    client = tc.TushareClient(api_key="k", interval=0.0)
     pages = list(client.query_paged("daily", {}))
     assert len(pages) == 2
     assert [p["offset"] for p in calls] == [0, 6000]
     client.close()
+
+
+# ================================================================
+# 网络瞬断重试 (2026-11-13 补齐日K 时实测 SSL EOF 导致整批中止)
+# ================================================================
+
+def _resp_ok(payload: dict):
+    class _R:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return payload
+
+    return _R()
+
+
+def test_client_retries_on_network_error(monkeypatch):
+    """SSL EOF / 连接重置 这类随机失败 → 指数退避重试后成功。"""
+    import httpx as _httpx
+
+    attempts = {"n": 0}
+
+    def _fake_post(self, *a, **kw):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise _httpx.ReadError("SSL EOF")
+        return _resp_ok({"code": 0, "data": {"fields": ["ts_code"], "items": [["000001.SZ"]]}})
+
+    monkeypatch.setattr(_httpx.Client, "post", _fake_post)
+    monkeypatch.setattr("app.plugins.tushare.client.time.sleep", lambda _s: None)
+    client = tc.TushareClient(api_key="k", interval=0.0)
+    rows = client.query("daily", {"ts_code": "000001.SZ"})
+    assert attempts["n"] == 3
+    assert rows == [{"ts_code": "000001.SZ"}]
+    client.close()
+
+
+def test_client_retries_on_5xx(monkeypatch):
+    """服务端 5xx → 重试; 不当作业务错误直接抛。"""
+    import httpx as _httpx
+
+    attempts = {"n": 0}
+
+    class _R500:
+        status_code = 502
+
+        @staticmethod
+        def json():
+            return {}
+
+    def _fake_post(self, *a, **kw):
+        attempts["n"] += 1
+        if attempts["n"] < 2:
+            return _R500()
+        return _resp_ok({"code": 0, "data": {"fields": ["ts_code"], "items": [["000001.SZ"]]}})
+
+    monkeypatch.setattr(_httpx.Client, "post", _fake_post)
+    monkeypatch.setattr("app.plugins.tushare.client.time.sleep", lambda _s: None)
+    client = tc.TushareClient(api_key="k", interval=0.0)
+    assert client.query("daily", {}) == [{"ts_code": "000001.SZ"}]
+    assert attempts["n"] == 2
+    client.close()
+
+
+def test_client_does_not_retry_business_error(monkeypatch):
+    """业务错误码 (积分不足/参数错) → 不重试, 立即抛出。
+
+    注意: 40203 是**限频**码 (实测 "访问接口(daily)频率超限(300次/分钟)"), 会被退避重试;
+    积分/权限类错误用 40201 断言, 二者语义不同。
+    """
+    import httpx as _httpx
+
+    attempts = {"n": 0}
+
+    def _fake_post(self, *a, **kw):
+        attempts["n"] += 1
+        return _resp_ok({"code": 40201, "msg": "积分不足"})
+
+    monkeypatch.setattr(_httpx.Client, "post", _fake_post)
+    monkeypatch.setattr("app.plugins.tushare.client.time.sleep", lambda _s: None)
+    client = tc.TushareClient(api_key="k", interval=0.0)
+    with pytest.raises(tc.TushareError, match="40201"):
+        client.query("daily", {})
+    assert attempts["n"] == 1, "业务错误不应重试 (白耗限频配额)"
+    client.close()
+
+
+def test_client_retries_rate_limit_error(monkeypatch):
+    """限频 (40203) → 退避重试; 全历史回补动辄上万次请求, 撞上限频不应中断整个作业。"""
+    import httpx as _httpx
+
+    attempts = {"n": 0}
+
+    def _fake_post(self, *a, **kw):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            msg = "抱歉，您访问接口(daily)频率超限(300次/分钟)"  # noqa: RUF001 (原文含全角标点)
+            return _resp_ok({"code": 40203, "msg": msg})
+        return _resp_ok({"code": 0, "data": {"fields": ["ts_code"], "items": [["000001.SZ"]]}})
+
+    monkeypatch.setattr(_httpx.Client, "post", _fake_post)
+    monkeypatch.setattr("app.plugins.tushare.client.time.sleep", lambda _s: None)
+    client = tc.TushareClient(api_key="k", interval=0.0)
+    assert client.query("daily", {}) == [{"ts_code": "000001.SZ"}]
+    assert attempts["n"] == 3, "限频应退避重试直到恢复"
+    client.close()
+
+
+def test_client_gives_up_on_persistent_rate_limit(monkeypatch):
+    """持续限频 → 退避重试耗尽后抛错 (不静默返回空数据)。"""
+    import httpx as _httpx
+
+    attempts = {"n": 0}
+
+    def _fake_post(self, *a, **kw):
+        attempts["n"] += 1
+        return _resp_ok({"code": 40203, "msg": "频率超限"})
+
+    monkeypatch.setattr(_httpx.Client, "post", _fake_post)
+    monkeypatch.setattr("app.plugins.tushare.client.time.sleep", lambda _s: None)
+    client = tc.TushareClient(api_key="k", interval=0.0)
+    with pytest.raises(tc.TushareError, match="40203"):
+        client.query("daily", {})
+    assert attempts["n"] == tc._RATE_LIMIT_RETRIES + 1
+    client.close()
+
+
+def test_client_permission_denied_40203_fails_fast(monkeypatch):
+    """40203 + 「没有访问该接口的权限」→ 权限不足, 立即抛错, 不进限频退避 (否则每个请求空等约 5 分钟)。"""
+    import httpx as _httpx
+
+    attempts = {"n": 0}
+    sleeps: list[float] = []
+
+    def _fake_post(self, *a, **kw):
+        attempts["n"] += 1
+        return _resp_ok({"code": 40203, "msg": "抱歉, 您没有访问该接口的权限"})
+
+    monkeypatch.setattr(_httpx.Client, "post", _fake_post)
+    monkeypatch.setattr("app.plugins.tushare.client.time.sleep", sleeps.append)
+    client = tc.TushareClient(api_key="k", interval=0.0)
+    with pytest.raises(tc.TushareError, match="权限"):
+        client.query("daily", {})
+    assert attempts["n"] == 1
+    assert sleeps == []
+    client.close()
+
+
+def test_rate_limit_message_mentioning_permission_still_retries():
+    """限频文案本身也带「权限」二字, 仍须归为限频。"""
+    msg = "抱歉，您每分钟最多访问该接口500次，权限的具体详情访问：https://tushare.pro/document/1?doc_id=108。"  # noqa: RUF001
+    assert tc._is_permission_denied(msg) is False
+    assert tc._is_permission_denied("抱歉, 您没有访问该接口的权限") is True
+
+
+def test_client_gives_up_after_max_retries(monkeypatch):
+    """持续网络失败 → 重试耗尽后抛错, 不静默返回空。"""
+    import httpx as _httpx
+
+    attempts = {"n": 0}
+
+    def _fake_post(self, *a, **kw):
+        attempts["n"] += 1
+        raise _httpx.ReadError("SSL EOF")
+
+    monkeypatch.setattr(_httpx.Client, "post", _fake_post)
+    monkeypatch.setattr("app.plugins.tushare.client.time.sleep", lambda _s: None)
+    client = tc.TushareClient(api_key="k", interval=0.0)
+    with pytest.raises(tc.TushareError, match="重试"):
+        client.query("daily", {})
+    assert attempts["n"] == tc._MAX_RETRIES + 1
+    client.close()
+
+
+# ---- 全市场口径 (含已退市代码) ----
+
+
+def test_daily_include_all_market_keeps_codes_outside_symbols(monkeypatch):
+    """全市场口径: 按日模式一次即返回全市场, 过滤会把已退市代码的历史丢掉。"""
+    days = [date(1998, 6, 1)]
+    rows = [_daily_row(code="000001.SZ", day="19980601"),
+            _daily_row(code="000300.SZ", day="19980601")]  # 早已退市, 不在请求标的里
+    client = _FakeClient(trade_days=days, daily_by_date={"19980601": rows})
+    p = _provider(monkeypatch, client)
+    symbols = _wide_universe()
+
+    default = p.get_daily(symbols, datetime(1998, 6, 1), datetime(1998, 6, 1))
+    assert default["symbol"].to_list() == ["000001.SZ"]
+
+    allmkt = p.get_daily(
+        symbols, datetime(1998, 6, 1), datetime(1998, 6, 1), include_all_market=True
+    )
+    assert set(allmkt["symbol"].to_list()) == {"000001.SZ", "000300.SZ"}
+    assert allmkt.height == 2
+
+
+def test_adj_factor_include_all_market_keeps_codes_outside_symbols(monkeypatch):
+    """全市场口径的除权因子同样不过滤标的。"""
+    days = [date(1995, 6, 1), date(1995, 6, 2)]
+    client = _FakeClient(
+        trade_days=days,
+        adj_by_date={
+            "19950601": [_factor_row("000001.SZ", "19950601", 1.0),
+                         _factor_row("000022.SZ", "19950601", 1.0)],
+            "19950602": [_factor_row("000001.SZ", "19950602", 1.0),
+                         _factor_row("000022.SZ", "19950602", 2.0)],
+        },
+    )
+    p = _provider(monkeypatch, client)
+    events = p.get_adj_factors(
+        _wide_universe(), datetime(1995, 6, 1), datetime(1995, 6, 2), include_all_market=True
+    )
+    assert events["symbol"].to_list() == ["000022.SZ"]
+    assert events["ex_factor"][0] == pytest.approx(2.0)
+
+
+# ---- 流式除权因子还原 ----
+
+
+def test_adj_factor_streaming_matches_full_batch_conversion(monkeypatch):
+    """流式还原 (逐日比对上一次因子) == 全量累积后 shift(1) 还原。
+
+    覆盖停牌缺口: 标的某日无数据时, 比价基准应是它上一次出现的交易日。
+    """
+    days = [date(2024, 3, 1), date(2024, 3, 4), date(2024, 3, 5)]
+    rows_by_day = {
+        "20240301": [_factor_row("000001.SZ", "20240301", 1.0),
+                     _factor_row("600000.SH", "20240301", 1.0)],
+        # 000001.SZ 停牌 (无数据)
+        "20240304": [_factor_row("600000.SH", "20240304", 1.0)],
+        "20240305": [_factor_row("000001.SZ", "20240305", 1.5),
+                     _factor_row("600000.SH", "20240305", 1.2)],
+    }
+    client = _FakeClient(trade_days=days, adj_by_date=rows_by_day)
+    p = _provider(monkeypatch, client)
+
+    streaming = p.get_adj_factors(
+        _wide_universe("000001.SZ", "600000.SH"), datetime(2024, 3, 1), datetime(2024, 3, 5)
+    )
+
+    # 旧口径: 全量累积 → _factor_frame → _to_event_ratios
+    all_rows = [r for day_rows in rows_by_day.values() for r in day_rows]
+    legacy = tp._to_event_ratios(
+        tp._factor_frame(all_rows, {"000001.SZ", "600000.SH"})
+    ).sort(["symbol", "trade_date"])
+
+    assert streaming.height == legacy.height
+    assert streaming["symbol"].to_list() == legacy["symbol"].to_list()
+    assert streaming["trade_date"].to_list() == legacy["trade_date"].to_list()
+    for a, b in zip(
+        streaming["ex_factor"].to_list(), legacy["ex_factor"].to_list(), strict=True
+    ):
+        assert a == pytest.approx(b)
+    # 停牌缺口后仍要出事件: 000001.SZ 的 1.5 倍除权
+    assert streaming.filter(pl.col("symbol") == "000001.SZ")["ex_factor"][0] == pytest.approx(1.5)

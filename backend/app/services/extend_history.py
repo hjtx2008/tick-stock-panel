@@ -105,10 +105,13 @@ def run_extend_history(
     value: int,
     unit: str,
     on_progress: Callable | None = None,
+    include_all_market: bool = False,
 ) -> dict:
     """向前扩展历史数据的主函数。
 
     完全独立于 daily_pipeline.run_now(),不调用其任何逻辑。
+    include_all_market=True 时按"全市场口径"取数: 不按标的过滤, 连同已退市代码
+    的历史一并落库 (按日模式一次即返回全市场, 过滤只会把退市股丢掉)。
     返回结果 dict 供 job_store 记录。
     """
     emit = on_progress or _noop
@@ -152,6 +155,7 @@ def run_extend_history(
         start_date=datetime.combine(new_start, datetime.min.time()),
         end_date=datetime.combine(earliest, datetime.min.time()),
         on_chunk_done=_daily_chunk,
+        include_all_market=include_all_market,
     )
     emit("extend_history", 45, f"日K 完成,写入 {written_daily} 行")
     logger.info("extend_history: daily K done, %d rows", written_daily)
@@ -180,6 +184,7 @@ def run_extend_history(
             universe, repo, capset,
             start_time=adj_start, end_time=adj_end,
             on_chunk_done=_adj_chunk,
+            include_all_market=include_all_market,
         )
         emit("extend_history", 60, f"除权因子完成,{written_adj} 行")
         logger.info("extend_history: adj_factor done, %d rows", written_adj)

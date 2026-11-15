@@ -255,6 +255,19 @@ provider 不应自行切换或回退到其他数据源。
 明确上界,不得先把全部结果放入列表再 `concat`。`on_chunk_done(cur, total)` 必须覆盖空批次,
 确保最终 `cur == total`。
 
+### 全市场口径 (`include_all_market`)
+
+`get_daily` / `iter_daily` / `get_adj_factors` 可选支持关键字参数
+`include_all_market: bool = False`:
+
+- `False`(默认): 只返回 `symbols` 请求集合内的标的;
+- `True`: **不做标的过滤** —— 适用于"按交易日一次取全市场"的源(如 Tushare),
+  过滤会把已退市代码的历史一并丢掉。此时请求集合仅用于决定取数模式
+  (标的数是否达到全市场按日模式阈值), 不影响返回内容。
+
+触发方式: `POST /api/kline/extend_history` 请求体带 `{"include_all_market": true}`。
+未实现该可选参数的 provider 会被自动忽略该标志(按 `False` 语义执行),保持兼容。
+
 ### get_realtime 行字段
 
 | 字段 | 必需 | 契约 |

@@ -286,6 +286,7 @@ class TushareProvider:
         end_time: datetime | None,
         asset_type: str = "stock",
         on_chunk_done: Callable[[int, int], None] | None = None,
+        include_all_market: bool = False,
     ) -> pl.DataFrame:
         """A 股日K → 内部契约。未复权原始价、vol 手不转换、amount 千元乘 1000 转元。"""
         chunks = [
@@ -296,6 +297,7 @@ class TushareProvider:
                 end_time=end_time,
                 asset_type=asset_type,
                 on_chunk_done=on_chunk_done,
+                include_all_market=include_all_market,
             )
             if not df.is_empty()
         ]
@@ -308,11 +310,15 @@ class TushareProvider:
         end_time: datetime | None,
         asset_type: str = "stock",
         on_chunk_done: Callable[[int, int], None] | None = None,
+        include_all_market: bool = False,
     ) -> Iterator[pl.DataFrame]:
         """分批产出日K, 供历史同步逐批落盘, 避免全市场结果累积在内存。
 
         Tushare daily 仅覆盖股票(ETF/指数另有 fund_daily/index_daily), 故
         asset_type != "stock" 时直接不产出 → 上层回退现有数据源。
+
+        include_all_market=True 时不做标的过滤 —— 按日模式一次就返回全市场
+        (含已退市代码), 过滤会把退市股的历史丢掉; 仅"全市场口径"的历史回补需要。
         """
         if not symbols or asset_type != "stock":
             return
@@ -330,7 +336,9 @@ class TushareProvider:
                 logger.warning("Tushare 交易日历不可用, 回退逐标的模式: %s", e)
                 days = []
         if days:
-            yield from self._iter_daily_by_date(client, days, symset, on_chunk_done)
+            yield from self._iter_daily_by_date(
+                client, days, symset, on_chunk_done, include_all_market
+            )
         else:
             yield from self._iter_daily_by_symbol(
                 client, sorted(symset), start_d, end_d, on_chunk_done
@@ -342,10 +350,12 @@ class TushareProvider:
         days: list[date],
         symset: set[str],
         on_chunk_done: Callable[[int, int], None] | None,
+        include_all_market: bool = False,
     ) -> Iterator[pl.DataFrame]:
         """逐交易日取全市场日K, 按请求标的过滤后逐日产出。"""
         total = len(days)
         failed = 0
+        filter_set = None if include_all_market else symset
         for done, day in enumerate(days, start=1):
             try:
                 rows = client.daily_by_date(day)
@@ -353,7 +363,7 @@ class TushareProvider:
                 failed += 1
                 logger.warning("Tushare 日K拉取失败 %s: %s", day, e)
             else:
-                df = _daily_frame(rows, symset)
+                df = _daily_frame(rows, filter_set)
                 if not df.is_empty():
                     yield df
             if on_chunk_done:
@@ -397,11 +407,18 @@ class TushareProvider:
         end_time: datetime | None,
         asset_type: str = "stock",
         on_chunk_done: Callable[[int, int], None] | None = None,
+        include_all_market: bool = False,
     ) -> pl.DataFrame:
         """A 股除权因子 → 内部契约(symbol/trade_date/ex_factor, 单事件比值非累积)。
 
         ex_factor 需要"窗口前一个交易日"的因子作基准, 故实际取数窗口向前多
         _ADJ_BASELINE_BACKDAYS 个自然日; 还原后的事件再按请求窗口过滤。
+
+        按日模式为**流式还原**: 逐日取数 → 与该标的"上一次出现时的因子"比对 →
+        直接产出事件。全历史回补原始行可达 1800 万行, 先全部累积再转换会吃掉数 GB
+        内存, 故不缓存原始行, 只保留每只标的最后一次因子 (O(标的数))。
+
+        include_all_market=True 时不做标的过滤 (含已退市代码)。
         """
         schema = {"symbol": pl.String, "trade_date": pl.Date, "ex_factor": pl.Float64}
         if not symbols or asset_type != "stock":
@@ -414,7 +431,7 @@ class TushareProvider:
         # 基准窗口: 向前多取一段自然日, 保证首个除权事件能拿到 f(d_prev)
         raw_start = start_d - timedelta(days=_ADJ_BASELINE_BACKDAYS)
 
-        rows: list[dict] = []
+        events: list[dict] = []
         try:
             days = (
                 client.trade_days(raw_start, end_d)
@@ -428,12 +445,36 @@ class TushareProvider:
         if days:
             total = len(days)
             failed = 0
+            # 每只标的最近一次出现的因子 (停牌日不出现 → 保留上一次的值, 语义与
+            # _to_event_ratios 的 shift(1) 一致: 与该标的上一次出现日相比)
+            last: dict[str, float] = {}
             for done, day in enumerate(days, start=1):
                 try:
-                    rows.extend(client.adj_factor_by_date(day))
+                    rows = client.adj_factor_by_date(day)
                 except TushareError as e:
                     failed += 1
                     logger.warning("Tushare 除权因子拉取失败 %s: %s", day, e)
+                else:
+                    cur: dict[str, float] = {}
+                    for r in rows:
+                        code = r.get("ts_code")
+                        if not code:
+                            continue
+                        if not include_all_market and code not in symset:
+                            continue
+                        factor = _to_float(r.get("adj_factor"))
+                        if factor is None:
+                            continue
+                        cur[str(code)] = factor
+                    for code, factor in cur.items():
+                        prev = last.get(code)
+                        if prev is not None and prev != 0:
+                            ratio = factor / prev
+                            if abs(ratio - 1.0) > _ADJ_EPS:
+                                events.append(
+                                    {"symbol": code, "trade_date": day, "ex_factor": ratio}
+                                )
+                        last[code] = factor
                 if on_chunk_done:
                     on_chunk_done(done, total)
             _check_failure("除权因子", failed, total, unit="个交易日")
@@ -443,24 +484,26 @@ class TushareProvider:
             failed = 0
             for done, sym in enumerate(syms, start=1):
                 try:
-                    rows.extend(client.adj_factor_by_symbol(sym, raw_start, end_d))
+                    rows = client.adj_factor_by_symbol(sym, raw_start, end_d)
                 except TushareError as e:
                     failed += 1
                     logger.warning("Tushare 除权因子拉取失败 %s: %s", sym, e)
+                else:
+                    # 逐标的模式单只数据量小, 直接复用统一的比值还原规则
+                    frame = _factor_frame(rows, {sym})
+                    if not frame.is_empty():
+                        events.extend(_to_event_ratios(frame).to_dicts())
                 if on_chunk_done:
                     on_chunk_done(done, total)
             _check_failure("除权因子", failed, max(1, total), unit="只标的")
 
-        factors = _factor_frame(rows, symset)
-        if factors.is_empty():
+        if not events:
             return pl.DataFrame(schema=schema)
-        events = _to_event_ratios(factors).filter(
-            (pl.col("trade_date") >= start_d) & (pl.col("trade_date") <= end_d)
-        )
-        if events.is_empty():
-            return pl.DataFrame(schema=schema)
-        return events.sort(["symbol", "trade_date"]).with_columns(
-            pl.col("ex_factor").cast(pl.Float64)
+        out = pl.DataFrame(events, schema=schema)
+        return (
+            out.filter((pl.col("trade_date") >= start_d) & (pl.col("trade_date") <= end_d))
+            .sort(["symbol", "trade_date"])
+            .with_columns(pl.col("ex_factor").cast(pl.Float64))
         )
 
     # ---- 测试(设置页试拉) ----

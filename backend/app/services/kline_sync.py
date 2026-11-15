@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import logging
 import shutil
 import time
@@ -156,6 +157,14 @@ def sync_daily_batch(symbols: list[str],
     return pl.concat(out, how="diagonal_relaxed")
 
 
+def _supports_flag(fn, flag: str) -> bool:
+    """provider 方法是否支持某个可选参数 (内置插件与通用自定义源签名不一致)。"""
+    try:
+        return flag in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def sync_and_persist_daily_batch(
     symbols: list[str],
     repo: KlineRepository,
@@ -164,6 +173,7 @@ def sync_and_persist_daily_batch(
     start_date: datetime | None = None,
     end_date: datetime | None = None,
     on_chunk_done: Callable[[int, int], None] | None = None,
+    include_all_market: bool = False,
 ) -> int:
     """批量同步日 K 并落到 Parquet。返回写入的行数。
 
@@ -183,12 +193,18 @@ def sync_and_persist_daily_batch(
             start_time = start_date or (end_time - timedelta(days=days))
             iter_daily = getattr(provider, "iter_daily", None)
             if callable(iter_daily):
+                extra = (
+                    {"include_all_market": True}
+                    if include_all_market and _supports_flag(iter_daily, "include_all_market")
+                    else {}
+                )
                 return _persist_daily_chunks(
                     iter_daily(
                         symbols,
                         start_time=start_time,
                         end_time=end_time,
                         on_chunk_done=on_chunk_done,
+                        **extra,
                     ),
                     repo,
                 )
@@ -386,7 +402,8 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
                     start_time: datetime | None = None,
                     end_time: datetime | None = None,
                     on_chunk_done: Callable[[int, int], None] | None = None,
-                    asset_type: str = "stock") -> tuple[int, list[str]]:
+                    asset_type: str = "stock",
+                    include_all_market: bool = False) -> tuple[int, list[str]]:
     """同步除权因子(Starter+)。SDK 接口:`tf.klines.ex_factors(symbols=...)`。
 
     支持增量: 传 start_time/end_time 只拉取该时间范围内的新除权事件。
@@ -400,12 +417,19 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
         from app.data_providers import custom as custom_sources
         if custom_sources.provider_has_dataset(provider_name, "adj_factor"):
             provider = custom_sources.get_provider(provider_name)
+            extra = (
+                {"include_all_market": True}
+                if include_all_market
+                and _supports_flag(provider.get_adj_factors, "include_all_market")
+                else {}
+            )
             new_data = provider.get_adj_factors(
                 symbols,
                 start_time=start_time,
                 end_time=end_time,
                 asset_type=asset_type,
                 on_chunk_done=on_chunk_done,
+                **extra,
             )
             if new_data.is_empty():
                 return 0, []

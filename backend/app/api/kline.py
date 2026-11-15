@@ -1265,7 +1265,8 @@ async def clear_minute(request: Request):
 async def extend_history(request: Request):
     """向前扩展历史日K数据 — 独立于盘后管道。
 
-    body: { "value": int, "unit": "day"|"month"|"year" }
+    body: { "value": int, "unit": "day"|"month"|"year", "include_all_market": bool }
+      include_all_market=True → 全市场口径: 不按标的过滤, 连同已退市代码的历史一并落库。
     返回 job_id,可轮询 /api/pipeline/jobs 查看进度。
     """
     import asyncio
@@ -1274,6 +1275,7 @@ async def extend_history(request: Request):
         body = await request.json()
         value = body.get("value")
         unit = body.get("unit", "month")
+        include_all_market = bool(body.get("include_all_market", False))
         if not value or value <= 0:
             raise HTTPException(status_code=400, detail="value 必须为正整数")
         if unit not in ("day", "month", "year"):
@@ -1309,7 +1311,11 @@ async def extend_history(request: Request):
                 job_store.start(job_id)
                 result = await loop.run_in_executor(
                     _long_task_executor,
-                    lambda: run_extend_history(repo, capset, value, unit, on_progress=progress),
+                    lambda: run_extend_history(
+                        repo, capset, value, unit,
+                        on_progress=progress,
+                        include_all_market=include_all_market,
+                    ),
                 )
                 if "error" in result:
                     job_store.fail(job_id, result["error"])
