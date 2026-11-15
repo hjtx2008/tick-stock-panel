@@ -36,6 +36,13 @@ export interface ChartMarker {
   above?: boolean
   /** 自定义标签颜色，覆盖默认的 kind 对应色。 */
   color?: string
+  /**
+   * 显式锚定价格 (y 轴坐标)。给定则忽略 low/high 锚点。
+   *
+   * 缠论买卖点用它在价格轴上按比例错位排版 (通达信口径: 买 LOW×0.975/0.985/0.995,
+   * 卖 HIGH×1.025/1.015/1.005), 避免多个级别的买卖点文字互相压盖。
+   */
+  price?: number
 }
 
 export interface ChartRange {
@@ -51,6 +58,58 @@ export interface ChartPriceLine {
   color?: string
   start?: string
   end?: string
+}
+
+/** 缠论「笔 / 线段」: 两点连线 (用 markLine 斜线绘制) */
+export interface ChartStroke {
+  startDate: string
+  startPrice: number
+  endDate: string
+  endPrice: number
+  direction: 'up' | 'down'
+  /** False = 末段尚未被破坏确认 → 画虚线 + 淡色区分。 */
+  confirmed?: boolean
+}
+
+/** 缠论「中枢」: 二维矩形 (用 markArea 绘制) */
+export interface ChartPivot {
+  startDate: string
+  endDate: string
+  /** 中枢上沿 */
+  zg: number
+  /** 中枢下沿 */
+  zd: number
+  direction: 'up' | 'down'
+  /** 嵌套层级: 0 = 笔级别中枢, 1 = 段级别中枢 (画法不同, 用不同底色)。 */
+  nestedLevel?: number
+}
+
+/** 缠论「分型」: 顶/底分型标记点 */
+export interface ChartFractal {
+  date: string
+  price: number
+  kind: 'top' | 'bottom'
+}
+
+/** 缠论「背驰」: 背驰标记点 */
+export interface ChartDivergence {
+  date: string
+  price: number
+  direction: 'up' | 'down'
+  /** trend = 趋势背驰 (TDX 17 号标记), consolidation = 盘整背驰 */
+  scope: 'trend' | 'consolidation'
+  diverged: boolean
+}
+
+/** 缠论叠加层: 笔(细) / 线段(粗) / 中枢(矩形) / 分型(点) / 背驰(标记) */
+export interface ChanChartOverlay {
+  strokes?: ChartStroke[]
+  segments?: ChartStroke[]
+  pivots?: ChartPivot[]
+  fractals?: ChartFractal[]
+  divergences?: ChartDivergence[]
+  /** 段级别背驰 (与笔级背驰用不同形状/颜色区分)。 */
+  segmentDivergences?: ChartDivergence[]
 }
 
 export interface StockInfo {
@@ -340,6 +399,8 @@ interface Props {
   activeIndicators?: string[]
   /** 成交量柱相对前 N 个交易日均量的显示设置 */
   volumeCompare?: VolumeCompareConfig
+  /** 缠论结构叠加 (笔 / 线段 / 中枢) */
+  chanOverlay?: ChanChartOverlay
 }
 
 // 序列颜色 (双主题通用); 画布轴/网格/文字等主题相关色走 CT() 动态取
@@ -474,6 +535,7 @@ function buildOption(
   infoIdx: number,
   linkedPrice: number | null | undefined,
   volumeCompare: VolumeCompareConfig,
+  chanOverlay: ChanChartOverlay | undefined,
 ): EChartsOption {
   const candleData = data.map(d => [d.open, d.close, d.low, d.high])
 
@@ -511,12 +573,16 @@ function buildOption(
           })
         }
       } else {
+        // 缠论买卖点用 price 锚定到价格轴上的错位位置 (通达信口径),
+        // 未给 price 时退回蜡烛 low/high。
+        const anchored = m.price != null
+        const anchor = m.price ?? (isBuy ? d.low : d.high)
         markPointData.push({
           name: m.label ?? '',
-          coord: [m.date, isBuy ? d.low : d.high],
+          coord: [m.date, anchor],
           symbol: 'arrow', symbolSize: 12,
           symbolRotate: isBuy ? 0 : 180,
-          symbolOffset: isBuy ? [0, '60%'] : [0, '-60%'],
+          symbolOffset: anchored ? [0, 0] : (isBuy ? [0, '60%'] : [0, '-60%']),
           itemStyle: { color: isBuy ? THEME.bull : isSell ? THEME.bear : CT().text },
           label: {
             show: !!m.label, formatter: m.label ?? '',
@@ -556,17 +622,23 @@ function buildOption(
   const priceLineValues = (priceLines ?? [])
     .map(line => line.value)
     .filter(value => Number.isFinite(value) && value > 0)
-  const axisMin = priceLineValues.length > 0
+  // 显式锚定价格的标记 (缠论买卖点错位排版) 也参与 y 轴范围计算,
+  // 否则价格乘数偏移出来的标记会被画到可视区外。
+  const markerPriceValues = (markers ?? [])
+    .map(m => m.price)
+    .filter((value): value is number => value != null && Number.isFinite(value) && value > 0)
+  const axisAnchorValues = priceLineValues.concat(markerPriceValues)
+  const axisMin = axisAnchorValues.length > 0
     ? ({ min, max }: { min: number; max: number }) => {
-        const nextMin = Math.min(min, ...priceLineValues)
-        const nextMax = Math.max(max, ...priceLineValues)
+        const nextMin = Math.min(min, ...axisAnchorValues)
+        const nextMax = Math.max(max, ...axisAnchorValues)
         return nextMin - Math.max((nextMax - nextMin) * 0.03, nextMax * 0.001)
       }
     : undefined
-  const axisMax = priceLineValues.length > 0
+  const axisMax = axisAnchorValues.length > 0
     ? ({ min, max }: { min: number; max: number }) => {
-        const nextMin = Math.min(min, ...priceLineValues)
-        const nextMax = Math.max(max, ...priceLineValues)
+        const nextMin = Math.min(min, ...axisAnchorValues)
+        const nextMax = Math.max(max, ...axisAnchorValues)
         return nextMax + Math.max((nextMax - nextMin) * 0.03, nextMax * 0.001)
       }
     : undefined
@@ -593,7 +665,7 @@ function buildOption(
   })
   xAxisIndices.push(0)
 
-  const markAreaData = (ranges ?? [])
+  const markAreaData: any[] = (ranges ?? [])
     .filter(r => dateIndexMap.has(r.start) && dateIndexMap.has(r.end))
     .map(r => ([
       {
@@ -646,6 +718,138 @@ function buildOption(
       return { yAxis: line.value, lineStyle, label, symbol: 'none' }
     })
 
+  // ===== 缠论叠加: 笔(细线) / 线段(粗线) / 中枢(矩形+轨线+竖框+中轴) =====
+  const chan = chanOverlay ?? {}
+  const chanColor = (dir: 'up' | 'down') => (dir === 'up' ? THEME.bull : THEME.bear)
+  const pushChanLine = (s: ChartStroke, width: number, opacity: number) => {
+    if (!dateIndexMap.has(s.startDate) || !dateIndexMap.has(s.endDate)) return
+    // 末段尚未被破坏确认 → 虚线 + 淡色 (与已确认线段区分)
+    const dashed = s.confirmed === false
+    markLineData.push([
+      { xAxis: s.startDate, yAxis: s.startPrice },
+      {
+        xAxis: s.endDate,
+        yAxis: s.endPrice,
+        symbol: 'none',
+        lineStyle: {
+          color: chanColor(s.direction),
+          width,
+          opacity: dashed ? opacity * 0.6 : opacity,
+          type: dashed ? 'dashed' : 'solid',
+        },
+        label: { show: false },
+      },
+    ])
+  }
+  for (const s of chan.strokes ?? []) pushChanLine(s, 1, 0.75)
+  for (const s of chan.segments ?? []) pushChanLine(s, 2.5, 0.95)
+
+  // 中枢: 上下沿轨线 + 起止竖框 + 中轴虚线 (通达信画法)
+  const PIVOT_LINE = 'rgba(139,92,246,0.75)'
+  const PIVOT_MID = 'rgba(139,92,246,0.45)'
+  for (const p of chan.pivots ?? []) {
+    if (!dateIndexMap.has(p.startDate) || !dateIndexMap.has(p.endDate)) continue
+    // 笔级别中枢 (nestedLevel 0) 用紫; 段级别中枢 (nestedLevel 1) 用青, 避免混淆
+    const rail = p.nestedLevel === 1 ? 'rgba(34,211,238,0.75)' : PIVOT_LINE
+    const mid = p.nestedLevel === 1 ? 'rgba(34,211,238,0.45)' : PIVOT_MID
+    markAreaData.push([
+      {
+        xAxis: p.startDate,
+        yAxis: p.zd,
+        itemStyle: {
+          color: p.nestedLevel === 1 ? 'rgba(34,211,238,0.10)' : 'rgba(139,92,246,0.12)',
+        },
+        label: { show: false },
+      },
+      { xAxis: p.endDate, yAxis: p.zg },
+    ])
+    // 上沿轨线
+    markLineData.push([
+      { xAxis: p.startDate, yAxis: p.zg },
+      { xAxis: p.endDate, yAxis: p.zg, symbol: 'none', lineStyle: { color: rail, width: 1 }, label: { show: false } },
+    ])
+    // 下沿轨线
+    markLineData.push([
+      { xAxis: p.startDate, yAxis: p.zd },
+      { xAxis: p.endDate, yAxis: p.zd, symbol: 'none', lineStyle: { color: rail, width: 1 }, label: { show: false } },
+    ])
+    // 中轴虚线 (ZG+ZD)/2
+    const midPrice = (p.zg + p.zd) / 2
+    markLineData.push([
+      { xAxis: p.startDate, yAxis: midPrice },
+      {
+        xAxis: p.endDate, yAxis: midPrice, symbol: 'none',
+        lineStyle: { color: mid, width: 1, type: 'dashed' },
+        label: { show: false },
+      },
+    ])
+    // 起止竖框
+    for (const x of [p.startDate, p.endDate]) {
+      markLineData.push([
+        { xAxis: x, yAxis: p.zd },
+        { xAxis: x, yAxis: p.zg, symbol: 'none', lineStyle: { color: rail, width: 1.5 }, label: { show: false } },
+      ])
+    }
+  }
+
+  // 分型 / 背驰 标记点 (挂在独立 series 上, 避免与紧凑模式的 markPoint 增量更新互相覆盖)
+  const chanMarkPointData: any[] = []
+  for (const f of chan.fractals ?? []) {
+    if (!dateIndexMap.has(f.date)) continue
+    chanMarkPointData.push({
+      name: f.kind,
+      coord: [f.date, f.price],
+      symbol: 'triangle', symbolSize: 5,
+      symbolRotate: f.kind === 'top' ? 0 : 180,
+      itemStyle: { color: f.kind === 'top' ? 'rgba(199,64,64,0.75)' : 'rgba(45,155,101,0.75)' },
+      label: { show: false },
+      z: 90,
+    })
+  }
+  for (const d of chan.divergences ?? []) {
+    if (!dateIndexMap.has(d.date)) continue
+    if (!d.diverged) continue
+    const isTrend = d.scope === 'trend'
+    chanMarkPointData.push({
+      name: isTrend ? '背驰' : '盘整背驰',
+      coord: [d.date, d.price],
+      symbol: 'diamond', symbolSize: 9,
+      itemStyle: { color: isTrend ? '#FACC15' : 'rgba(142,142,150,0.85)' },
+      label: {
+        show: true,
+        formatter: isTrend ? '背' : '盘背',
+        position: d.direction === 'down' ? 'bottom' : 'top',
+        distance: 6,
+        color: isTrend ? '#FACC15' : CT().text,
+        fontSize: 10,
+        fontFamily: 'JetBrains Mono, monospace',
+      },
+      z: 95,
+    })
+  }
+  // 段背驰: 用 pin 形状 + 橙色, 与笔级背驰 (diamond / 黄) 区分
+  for (const d of chan.segmentDivergences ?? []) {
+    if (!dateIndexMap.has(d.date)) continue
+    if (!d.diverged) continue
+    const isTrend = d.scope === 'trend'
+    chanMarkPointData.push({
+      name: isTrend ? '段背驰' : '段盘整背驰',
+      coord: [d.date, d.price],
+      symbol: 'pin', symbolSize: 11,
+      itemStyle: { color: isTrend ? '#FB923C' : 'rgba(251,146,60,0.5)' },
+      label: {
+        show: true,
+        formatter: isTrend ? '段背' : '段盘背',
+        position: d.direction === 'down' ? 'bottom' : 'top',
+        distance: 6,
+        color: isTrend ? '#FB923C' : CT().text,
+        fontSize: 10,
+        fontFamily: 'JetBrains Mono, monospace',
+      },
+      z: 96,
+    })
+  }
+
   if (linkedPrice != null) {
     markLineData.push({
       yAxis: linkedPrice,
@@ -679,6 +883,17 @@ function buildOption(
     markArea: markAreaData.length > 0 ? { silent: true, data: markAreaData } : undefined,
     markLine: markLineData.length > 0 ? { silent: true, symbol: 'none', data: markLineData, animation: false } : undefined,
   })
+
+  // 分型 / 背驰标记: 挂在独立 series 上
+  // (紧凑模式的增量更新会整体替换 K 线 series 的 markPoint, 挂一起会被抹掉)
+  if (chanMarkPointData.length > 0) {
+    series.push({
+      name: '缠论标记', type: 'scatter', data: [],
+      xAxisIndex: 0, yAxisIndex: 0,
+      animation: false, silent: true,
+      markPoint: { data: chanMarkPointData, animation: false },
+    })
+  }
 
   if (hasMA) {
     const maLine = (key: keyof OHLC, color: string, name: string) => ({
@@ -817,6 +1032,7 @@ export function EChartsCandlestick({
   visibleBars = 60,
   activeIndicators = [],
   volumeCompare = { enabled: true, days: 1 },
+  chanOverlay,
 }: Props) {
   const hoverSurfaceRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -1132,12 +1348,16 @@ export function EChartsCandlestick({
           })
         }
       } else {
+        // 缠论买卖点用 price 锚定到价格轴上的错位位置 (通达信口径),
+        // 未给 price 时退回蜡烛 low/high。
+        const anchored = m.price != null
+        const anchor = m.price ?? (isBuy ? d.low : d.high)
         markPointData.push({
           name: m.label ?? '',
-          coord: [m.date, isBuy ? d.low : d.high],
+          coord: [m.date, anchor],
           symbol: 'arrow', symbolSize: 12,
           symbolRotate: isBuy ? 0 : 180,
-          symbolOffset: isBuy ? [0, '60%'] : [0, '-60%'],
+          symbolOffset: anchored ? [0, 0] : (isBuy ? [0, '60%'] : [0, '-60%']),
           itemStyle: { color: isBuy ? THEME.bull : isSell ? THEME.bear : CT().text },
           label: {
             show: !!m.label, formatter: m.label ?? '',
@@ -1178,6 +1398,7 @@ export function EChartsCandlestick({
       infoIdxRef.current,
       linkedPrice,
       volumeCompare,
+      chanOverlay,
     )
 
     chart.setOption(option, true)
@@ -1195,7 +1416,7 @@ export function EChartsCandlestick({
     if (infoEl) {
       infoEl.innerHTML = getInfoBarHTML()
     }
-  }, [data, markers, ranges, priceLines, linkedPrice, showMA, showMarkersProp, activeIndicators, volumeCompare, chartHeight, dates, dateIndexMap, initialZoom, getInfoBarHTML, theme])
+  }, [data, markers, ranges, priceLines, linkedPrice, showMA, showMarkersProp, activeIndicators, volumeCompare, chanOverlay, chartHeight, dates, dateIndexMap, initialZoom, getInfoBarHTML, theme])
 
   // 渲染信息栏容器 (内容由 JS 直接写入)
   const initialHTML = useMemo(() => {

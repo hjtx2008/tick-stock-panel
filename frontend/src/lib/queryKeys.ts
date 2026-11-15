@@ -116,6 +116,14 @@ export const QK = {
   // 概念涨幅轮动矩阵
   rpsRotation:          (days: number) => ['rps-rotation', days] as const,
 
+  // 缠论结构分析 (后端扩展 chan.analysis) — 日线级别, 不进 SSE 刷新
+  chanStructure:       (symbol: string, days: number, priceMode: string, anchor?: string) =>
+                           ['chan-structure', symbol, days, priceMode, anchor ?? ''] as const,
+  chanKline:           (symbol: string, days: number) =>
+                           ['chan-kline', symbol, days] as const,
+  // 缠论选股 (后端扩展 chan.analysis) — 全市场扫描, 手动触发
+  chanScreen:          (payload: unknown) => ['chan-screen', payload] as const,
+
   // 市场环境(Regime) — 日级离线计算, 不进 SSE 刷新
   regimeHistory:        (limit?: number) => ['regime-history', limit ?? 0] as const,
   regimeLatest:         ['regime-latest'] as const,

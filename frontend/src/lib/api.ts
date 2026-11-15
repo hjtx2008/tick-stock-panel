@@ -286,6 +286,179 @@ export interface KlineDailyLatestResponse {
   source: 'live' | 'none'
 }
 
+// ===== 缠论结构分析 =====
+
+export interface ChanFractal {
+  kind: string
+  date: string
+  price: number
+  bar_index: number
+  confirmed_date: string
+}
+
+export interface ChanStroke {
+  direction: 'up' | 'down'
+  start_date: string
+  end_date: string
+  start_price: number
+  end_price: number
+  k_count: number
+  amplitude: number
+  strength: number
+  confirmed_date: string
+}
+
+export interface ChanSegment {
+  direction: 'up' | 'down'
+  start_date: string
+  end_date: string
+  start_price: number
+  end_price: number
+  stroke_count: number
+  /** 线段跨越的 K 线根数 (交易日口径)。 */
+  k_count: number
+  /** 段幅度 := |end_price - start_price|。 */
+  amplitude: number
+  /** 段力度 := 幅度 / k_count * 100 (与笔力度同口径)。 */
+  strength: number
+  confirmed_date: string
+  /** False = 末段尚未被破坏确认 (图上画虚线)。 */
+  confirmed: boolean
+}
+
+export interface ChanPivot {
+  direction: 'up' | 'down'
+  zg: number
+  zd: number
+  start_date: string
+  end_date: string
+  stroke_count: number
+  nested_level: number
+  confirmed_date: string
+}
+
+export interface ChanSignal {
+  kind: string
+  label: string
+  date: string
+  price: number
+  bar_index: number
+  confirmed_date: string
+  detail: Record<string, unknown>
+}
+
+/** 缠论背驰标记 (含未成立候选, 由 diverged 区分)。 */
+export interface ChanDivergence {
+  stroke_index: number
+  prev_index: number
+  date: string
+  price: number
+  direction: 'up' | 'down'
+  diverged: boolean
+  /** trend = 趋势背驰, consolidation = 盘整背驰 (盘整背驰不产生买卖点)。 */
+  scope: 'trend' | 'consolidation'
+  detail: Record<string, unknown>
+}
+
+/** 段级别背驰标记 (比较单元是线段, segment_index 为线段下标)。 */
+export interface ChanSegmentDivergence {
+  segment_index: number
+  prev_index: number
+  date: string
+  price: number
+  direction: 'up' | 'down'
+  diverged: boolean
+  /** trend = 趋势背驰, consolidation = 盘整背驰。 */
+  scope: 'trend' | 'consolidation'
+  detail: Record<string, unknown>
+}
+
+export interface ChanSummary {
+  status: string
+  symbol: string
+  price_mode: string
+  adj_anchor_date: string | null
+  level: string
+  trend: string
+  bar_count: number
+  fractal_count: number
+  stroke_count: number
+  segment_count: number
+  pivot_count: number
+  signal_count: number
+  divergence_count?: number
+  confirmed_divergence_count?: number
+  /** 段级中枢数量 (nested_level=1)。 */
+  segment_pivot_count?: number
+  segment_divergence_count?: number
+  confirmed_segment_divergence_count?: number
+  adj_factor_missing: boolean
+  warnings: string[]
+}
+
+export interface ChanStructureResponse {
+  symbol: string
+  asset_type?: string
+  price_mode: string
+  adj_anchor_date: string | null
+  level: string
+  as_of: string | null
+  dates: string[]
+  closes: number[]
+  raw_closes: number[]
+  summary: ChanSummary
+  warnings: string[]
+  fractals?: ChanFractal[]
+  strokes?: ChanStroke[]
+  segments?: ChanSegment[]
+  pivots?: ChanPivot[]
+  /** 段级中枢 (nested_level=1)。 */
+  segment_pivots?: ChanPivot[]
+  signals?: ChanSignal[]
+  divergences?: ChanDivergence[]
+  segment_divergences?: ChanSegmentDivergence[]
+}
+
+/** 选股请求 (条件之间是「与」关系, 留空 = 该维度不限)。 */
+export interface ChanScreenRequest {
+  days?: number
+  symbols?: string[] | null
+  limit?: number
+  signal_kinds?: string[]
+  trend?: string[]
+  divergence_scope?: string[]
+  require_divergence?: boolean
+  require_segment_divergence?: boolean
+  require_segment_pivot?: boolean
+  max_signal_age?: number
+}
+
+/** 选股结果里的单个标的。 */
+export interface ChanScreenMatch {
+  symbol: string
+  name?: string | null
+  trend: string
+  status: string
+  last_date: string | null
+  last_close: number
+  bar_count: number
+  stroke_count: number
+  segment_count: number
+  pivot_count: number
+  segment_pivot_count: number
+  signals: { kind: string; label: string; date: string; price: number; bar_index: number }[]
+  divergences: { date: string; scope: string; diverged: boolean; direction: string }[]
+  segment_divergences: { date: string; scope: string; diverged: boolean; direction: string }[]
+}
+
+export interface ChanScreenResponse {
+  matches: ChanScreenMatch[]
+  scanned: number
+  total_matched: number
+  elapsed_ms: number
+  as_of?: string
+}
+
 // ===== Watchlist =====
 export interface WatchlistEntry {
   symbol: string
@@ -394,6 +567,8 @@ export interface ScreenerResultSummary {
   as_of: string
   /** 渐进式 run_all 写入的计算时间戳 (Unix ms); 监控实时叠加等来源无此字段 */
   computed_at?: number | null
+  /** 该策略本轮失败的原因; 无失败 → null/undefined */
+  error?: string | null
 }
 
 export interface ScreenerCachedSummary {
@@ -413,6 +588,8 @@ export interface ScreenerRunAllSummary {
   complete?: boolean
   /** 后台执行出错时的错误信息 (部分结果仍会返回) */
   error?: string | null
+  /** 单个策略失败清单 (strategy_id → 错误摘要); 批量已完成, 失败的策略被跳过 */
+  failed?: Record<string, string>
   /** 本次执行起点 (Unix ms, 后端时钟), 用于判断缓存结果是否属于本轮 */
   started_at?: number | null
 }
@@ -2284,6 +2461,31 @@ export const api = {
     request<KlineDailyLatestResponse>(
       `/api/kline/daily/latest?symbol=${encodeURIComponent(symbol)}`,
     ),
+
+  // 缠论结构分析 (后端扩展 chan.analysis)
+  chanStructure: (
+    symbol: string,
+    days = 250,
+    priceMode: 'qfq' | 'raw' | 'hfq' = 'qfq',
+    adjAnchorDate?: string,
+    include = 'structure,signals,divergences',
+  ) => {
+    const params = new URLSearchParams({
+      symbol,
+      days: String(days),
+      price_mode: priceMode,
+      include,
+    })
+    if (adjAnchorDate) params.set('adj_anchor_date', adjAnchorDate)
+    return request<ChanStructureResponse>(`/api/chan/structure?${params.toString()}`)
+  },
+  /** 缠论选股 (后端扩展 chan.analysis) —— 全市场扫描耗时数秒, 放宽超时 */
+  chanScreen: (body: ChanScreenRequest) =>
+    request<ChanScreenResponse>('/api/chan/screen', {
+      method: 'POST',
+      body: JSON.stringify(body),
+      timeoutMs: 180_000,
+    }),
   klineDailyBatch: (symbols: string[], days = 12) =>
     request<{ data: Record<string, KlineRow[]> }>('/api/kline/daily-batch', {
       method: 'POST',
@@ -3358,7 +3560,11 @@ export const api = {
     }),
 
   strategyRunAll: (asOf?: string) =>
-    request<{ as_of: string | null; results: Record<string, { total: number; as_of: string }> }>(
+    request<{
+      as_of: string | null
+      results: Record<string, { total: number; as_of: string; error?: string }>
+      failed?: Record<string, string>
+    }>(
       '/api/strategies/run-all',
       { method: 'POST', body: JSON.stringify({ as_of: asOf ?? null }) },
     ),
