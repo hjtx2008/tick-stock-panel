@@ -426,6 +426,7 @@ def run_all(req: RunAllRequest, request: Request):
         overrides_map={sid: all_overrides.get(sid, {}) for sid in strategy_ids},
     )
     results: dict[str, dict] = {}
+    failed: dict[str, str] = {}
     for sid, result in engine.run_all(
         context,
         params_map=params_map,
@@ -433,8 +434,16 @@ def run_all(req: RunAllRequest, request: Request):
         strategy_ids=strategy_ids,
     ).items():
         results[sid] = {"total": result.total, "as_of": str(as_of)}
+        # run_all 把单策略失败隔离成 total=0 占位; 带出错误, 否则调用方会把失败读成「0 命中」
+        err = getattr(result, "error", None)
+        if err:
+            results[sid]["error"] = err
+            failed[sid] = err
 
-    return {"as_of": str(as_of), "results": results}
+    payload: dict = {"as_of": str(as_of), "results": results}
+    if failed:
+        payload["failed"] = failed
+    return payload
 
 
 # ── 配置持久化 ───────────────────────────────────────────────────────

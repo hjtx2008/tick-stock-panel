@@ -22,8 +22,10 @@ import numpy as np
 import polars as pl
 
 from app.config import settings
+from app.indicators.pipeline import ENRICHED_COLUMNS
 from app.strategy.scoring import (
     SCORING_DIRECTION_LOW,
+    VIRTUAL_SCORING_DEPENDENCIES,
     effective_scoring,
     effective_scoring_directions,
     materialize_scoring_columns,
@@ -222,6 +224,9 @@ class StrategyResult:
     scores: dict[str, float] = field(default_factory=dict)
     entry_signal_hits: list[dict] = field(default_factory=list)
     exit_signal_hits: list[dict] = field(default_factory=list)
+    # 策略自身执行失败时的错误摘要 (如引用了不存在的指标列)。
+    # 批量运行中该策略被隔离跳过, 其余策略照常返回; 非空表示这条结果是失败占位。
+    error: str | None = None
 
 
 @dataclass
@@ -563,6 +568,14 @@ class StrategyEngine:
         elif filter_history_fn is None or filter_fn is not None:
             raise ValueError("python_history_legacy strategy must declare only filter_history")
 
+        required_features = (
+            frozenset(meta.get("required_features", []) or [])
+            | frozenset(getattr(mod, "REQUIRED_FEATURES", []) or [])
+        )
+        StrategyEngine._warn_unknown_required_features(
+            required_features, str(meta.get("id") or path)
+        )
+
         return StrategyDef(
             meta=meta,
             basic_filter=bf,
@@ -575,8 +588,7 @@ class StrategyEngine:
             max_hold_days=getattr(mod, "MAX_HOLD_DAYS", None),
             filter_fn=filter_fn,
             filter_history_fn=filter_history_fn,
-            required_features=frozenset(meta.get("required_features", []) or [])
-            | frozenset(getattr(mod, "REQUIRED_FEATURES", []) or []),
+            required_features=required_features,
             lookback_days=int(getattr(mod, "LOOKBACK_DAYS", meta.get("lookback_days", 1)) or 1),
             source=source,
             file_path=path,
@@ -586,6 +598,35 @@ class StrategyEngine:
             filter_minute_history_fn=filter_minute_history_fn,
             minute_daily_bars=minute_daily_bars,
         )
+
+    @staticmethod
+    def _warn_unknown_required_features(
+        required_features: frozenset[str],
+        strategy_id: str,
+    ) -> None:
+        """REQUIRED_FEATURES 声明了不存在的列 → 加载时告警 (不拦加载)。
+
+        2026-11-13 实测: AI 生成的策略在 REQUIRED_FEATURES 里声明了 vol_ma20,
+        而指标流水线只有 vol_ma5 / vol_ma10。该声明本身不导致取数失败
+        (引擎只对 csg_/csgi_ 前缀做强制校验), 但它说明策略作者以为有这一列 ——
+        与其等到运行时才炸, 不如加载时就点出来。
+
+        只告警不拒绝: 策略可能自行算出该列 (如 _vol_ma20), 强行拒绝会误杀。
+        """
+        available = set(ENRICHED_COLUMNS) | set(VIRTUAL_SCORING_DEPENDENCIES)
+        unknown = sorted(
+            name
+            for name in required_features
+            if not name.startswith(("csg_", "csgi_"))
+            and not name.startswith("_")
+            and name not in available
+        )
+        if unknown:
+            logger.warning(
+                "策略 %s 的 REQUIRED_FEATURES 声明了不存在的列: %s "
+                "(指标流水线共 %d 个真实列); 若策略未自行计算该列, 运行时会报缺列错",
+                strategy_id, unknown, len(ENRICHED_COLUMNS),
+            )
 
     def reload(self) -> None:
         """原子热重载；任一策略失败时保留上一版注册表。"""
@@ -1007,6 +1048,13 @@ class StrategyEngine:
                     + ", ".join(sorted(missing_csgi))
                 )
             df = s.filter_history_fn(df, params)
+            if df is None:
+                # 策略没写 return (常见于 AI 生成被截断的文件) → 明确报错,
+                # 而不是让 NoneType.columns 冒泡成难懂的 AttributeError。
+                raise ValueError(
+                    f"策略 {strategy_id} 的 filter_history 没有返回值 "
+                    "(函数体缺少 return, 常见于 AI 生成的文件被截断)"
+                )
             if "date" in df.columns:
                 df = df.filter(pl.col("date") == as_of)
         else:
@@ -1136,9 +1184,26 @@ class StrategyEngine:
         params_map = params_map or {}
         overrides_map = overrides_map or {}
         selected_ids = list(self._strategies) if strategy_ids is None else strategy_ids
-        selected = [(sid, self.get(sid)) for sid in selected_ids]
-        for _, strategy in selected:
-            self.validate_context(strategy, context)
+
+        # ── 逐策略前置校验 ─────────────────────────────────────
+        # 校验失败不再整批抛错: 记入 failed_map, 该策略标记为失败占位,
+        # 其余策略照常执行。
+        # (2026-11-13: 一条 timeframes/asset_types 声明不匹配的策略会让整个
+        #  run_all 抛 500, 其余 28 条结果全丢 —— 代价远大于跳过一条。)
+        failed_map: dict[str, str] = {}
+        selected: list[tuple[str, StrategyDef]] = []
+        for sid in selected_ids:
+            try:
+                strategy = self.get(sid)
+            except ValueError as e:
+                failed_map[sid] = f"ValueError: {e}"
+                continue
+            try:
+                self.validate_context(strategy, context)
+            except ValueError as e:
+                failed_map[sid] = f"ValueError: {e}"
+                continue
+            selected.append((sid, strategy))
 
         history_strats = [
             (sid, strategy)
@@ -1148,7 +1213,11 @@ class StrategyEngine:
         ]
         shared_history = context.history
         if history_strats and shared_history is None:
-            raise ValueError("selected strategies require history data")
+            # 历史数据缺失只影响需要它的策略, 不再整批抛错
+            for sid, _ in history_strats:
+                failed_map[sid] = "ValueError: selected strategies require history data"
+            blocked = {sid for sid, _ in history_strats}
+            selected = [(sid, s) for sid, s in selected if sid not in blocked]
 
         shared_matrix = context.market
         matrix_strats = [
@@ -1188,17 +1257,31 @@ class StrategyEngine:
 
         def _execute(sid: str) -> tuple[str, StrategyResult]:
             started = time.perf_counter()
-            result = self.run(
-                sid,
-                replace(
-                    context,
-                    current=df,
-                    history=shared_history,
-                    market=shared_matrix,
-                ),
-                params=params_map.get(sid),
-                overrides=overrides_map.get(sid),
-            )
+            try:
+                result = self.run(
+                    sid,
+                    replace(
+                        context,
+                        current=df,
+                        history=shared_history,
+                        market=shared_matrix,
+                    ),
+                    params=params_map.get(sid),
+                    overrides=overrides_map.get(sid),
+                )
+            except Exception as e:
+                # 单个策略失败隔离: 常见于策略引用了不存在的指标列
+                # (如 AI 生成的策略写了流水线没有的 vol_ma20)。
+                # 不隔离的话, 一个坏策略会让整个 run_all 抛 500,
+                # 其余 28 个正常策略的结果全部拿不到 —— 代价远大于跳过一条。
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                logger.exception("run_all: strategy %s failed, 已跳过该策略", sid)
+                return sid, StrategyResult(
+                    as_of=context.as_of,
+                    strategy_id=sid,
+                    elapsed_ms=elapsed_ms,
+                    error=f"{type(e).__name__}: {e}",
+                )
             elapsed_ms = (time.perf_counter() - started) * 1000
             # >=1s 打 INFO 供热点归因 (哪些策略吃掉了 run_all 的大头), 其余 DEBUG 防噪。
             log_fn = logger.info if elapsed_ms >= 1000 else logger.debug
@@ -1216,7 +1299,7 @@ class StrategyEngine:
                 max_workers=workers, thread_name_prefix="strategy-run"
             ) as pool:
                 futures = [pool.submit(_execute, sid) for sid, _ in selected]
-                # 按原顺序收集: 首个失败策略的异常语义与串行执行一致。
+                # 按原顺序收集 (与串行执行顺序一致)。
                 for future in futures:
                     sid, result = future.result()
                     results[sid] = result
@@ -1224,6 +1307,21 @@ class StrategyEngine:
             for sid, _ in selected:
                 sid, result = _execute(sid)
                 results[sid] = result
+
+        # 前置校验失败的策略补上失败占位, 并按 selected_ids 原顺序合并
+        if failed_map:
+            merged: dict[str, StrategyResult] = {}
+            for sid in selected_ids:
+                if sid in failed_map:
+                    merged[sid] = StrategyResult(
+                        as_of=context.as_of,
+                        strategy_id=sid,
+                        elapsed_ms=0.0,
+                        error=failed_map[sid],
+                    )
+                elif sid in results:
+                    merged[sid] = results[sid]
+            results = merged
 
         return results
 
@@ -1466,6 +1564,15 @@ class StrategyEngine:
             parallel=False,
         )
         ordered_results = [child_results[cid] for cid in child_ids]
+        # run_all 把子策略失败隔离成空结果占位; 组合策略不能把它当"0 命中"参与合并,
+        # 否则交集/min_confirm 会静默算出错误候选集。整体失败, 由外层 run_all 隔离。
+        failed_children = [
+            f"{res.strategy_id}: {res.error}" for res in ordered_results if res.error
+        ]
+        if failed_children:
+            raise ValueError(
+                f"composite {strategy_id} 子策略执行失败: " + "; ".join(failed_children)
+            )
 
         merged = composite_mod.merge_results(
             ordered_results,

@@ -96,12 +96,14 @@ interface StrategyCardProps {
   timeframeBadge?: string
   /** 后台计算中 (渐进式 run_all): 数字未出时显示脉冲占位 */
   computing?: boolean
+  /** 本轮该策略的计算错误 (坏策略只跳过自己, 其余策略照常返回) */
+  error?: string | null
 }
 
 export function StrategyCard({
   name, description, source, active, count, expiredCount,
   loading, cardSize,
-  onRun, disabled, onSettings, monitored, onToggleMonitor, timeframeBadge, computing,
+  onRun, disabled, onSettings, monitored, onToggleMonitor, timeframeBadge, computing, error,
 }: StrategyCardProps) {
   const cs = CARD_STYLES[cardSize]
   const activeCls = active
@@ -115,6 +117,16 @@ export function StrategyCard({
 
   // 失效数 > 0 时显示
   const hasExpired = expiredCount != null && expiredCount > 0
+
+  // 本轮失败标记 (悬停看原因); 失败策略不展示命中数 (0 会被误读成"无命中")
+  const errorBadge = error ? (
+    <span
+      className="text-[9px] px-1 py-px rounded border border-red-500/30 bg-red-500/10 text-red-400 shrink-0"
+      title={error}
+    >
+      失败
+    </span>
+  ) : null
 
   return (
     <motion.div
@@ -133,11 +145,12 @@ export function StrategyCard({
                 <span className="text-[9px] px-1 py-px rounded border font-medium leading-tight shrink-0 border-sky-500/30 bg-sky-500/10 text-sky-400">{timeframeBadge}</span>
               )}
               <span className="text-xs font-medium truncate text-foreground">{name}</span>
+              {errorBadge}
             </div>
             {description && (
               <span className="text-[10px] text-muted leading-tight mt-0.5 line-clamp-1">{description}</span>
             )}
-            {count != null && !loading && (
+            {count != null && !loading && !error && (
               <div className="mt-1.5 flex items-center gap-2">
                 <div className="flex items-center gap-1">
                   <span className={`text-sm font-mono font-bold tabular-nums ${countCls}`}>{count}</span>
@@ -178,7 +191,8 @@ export function StrategyCard({
                 <span className="text-[9px] px-1 py-px rounded border font-medium leading-tight shrink-0 border-sky-500/30 bg-sky-500/10 text-sky-400">{timeframeBadge}</span>
               )}
               <span className="text-xs font-medium truncate text-foreground">{name}</span>
-              {count != null && !loading && (
+              {errorBadge}
+              {count != null && !loading && !error && (
                 <span className={`text-xs font-mono font-bold tabular-nums shrink-0 ${countCls}`}>{count}</span>
               )}
               {count == null && !loading && computing && (
@@ -214,7 +228,8 @@ export function StrategyCard({
             className="flex items-center gap-1 cursor-pointer disabled:opacity-50 disabled:cursor-wait">
             <span className="text-[8px] px-0.5 rounded bg-secondary/10 text-muted border border-border font-medium leading-tight">{srcLabel}</span>
             <span className="text-[10px] font-medium whitespace-nowrap text-foreground">{name}</span>
-            {count != null && !loading && (
+            {errorBadge}
+            {count != null && !loading && !error && (
               <span className={`text-xs font-mono font-bold tabular-nums ${countCls}`}>{count}</span>
             )}
             {count == null && !loading && computing && (

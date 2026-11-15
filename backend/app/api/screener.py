@@ -377,17 +377,21 @@ def get_cached_summary(request: Request):
     """返回策略卡片所需的轻量摘要，不序列化股票明细。"""
     cached = _cached_with_realtime(request)
     results = cached.get("results") or {}
-    summary = {
-        sid: {
+    summary: dict[str, dict] = {}
+    for sid, result in results.items():
+        if not isinstance(result, dict):
+            continue
+        item = {
             "total": int(result.get("total") or 0),
             "as_of": result.get("as_of"),
             # 渐进式 run_all 写入的计算时间戳; 监控实时叠加/旧缓存无此字段 → None,
             # 前端视为新鲜 (有值即为最新一轮实时结果)
             "computed_at": result.get("computed_at"),
         }
-        for sid, result in results.items()
-        if isinstance(result, dict)
-    }
+        # 该策略本轮失败的原因 (渐进式后台补算失败时写入); 无失败则不带该键
+        if result.get("error"):
+            item["error"] = result["error"]
+        summary[sid] = item
 
     cached_as_of = cached.get("as_of")
     ever_rows = cached.get("today_ever_rows") or {}
@@ -540,20 +544,36 @@ def _run_all_progressive(
         elapsed_map: dict[str, float] = {}
         for sid in ordered_ids:
             t0 = time.perf_counter()
-            single = engine.run_all(
-                context,
-                params_map=params_map,
-                overrides_map=overrides_map,
-                strategy_ids=[sid],
-                parallel=False,
-            )
-            result = single[sid]
-            payload = {
-                "total": result.total,
-                "as_of": str(as_of),
-                "rows": _safe(asdict(result)).get("rows", []),
-                "computed_at": int(time.time() * 1000),
-            }
+            try:
+                single = engine.run_all(
+                    context,
+                    params_map=params_map,
+                    overrides_map=overrides_map,
+                    strategy_ids=[sid],
+                    parallel=False,
+                )
+                result = single[sid]
+                payload = {
+                    "total": result.total,
+                    "as_of": str(as_of),
+                    "rows": _safe(asdict(result)).get("rows", []),
+                    "computed_at": int(time.time() * 1000),
+                }
+                # 引擎内部已捕获的单策略失败 (error 字段) → 原样带出
+                if getattr(result, "error", None):
+                    payload["error"] = result.error
+            except Exception as e:
+                # 单条策略失败不中断整批。
+                # (2026-11-13: 异常原先会逃出 job() → handle.fail() → 渐进循环
+                #  中断, 后面所有策略一个都不再执行。)
+                logger.exception("run_all 渐进: 策略 %s 失败, 已跳过该策略", sid)
+                payload = {
+                    "total": 0,
+                    "as_of": str(as_of),
+                    "rows": [],
+                    "computed_at": int(time.time() * 1000),
+                    "error": f"{type(e).__name__}: {e}",
+                }
             all_results[sid] = payload
             elapsed_map[sid] = (time.perf_counter() - t0) * 1000
             # 逐策略增量落盘 (write_cache 同日按 sid 合并), 前端轮询即可逐个看到
@@ -584,12 +604,19 @@ def _run_all_progressive(
         len(done_results),
         len(snap["pending"]),
     )
+    # 单策略失败清单 (批量已完成, 但其中若干条失败) —— 与非渐进路径同口径
+    failed = {
+        sid: payload["error"]
+        for sid, payload in done_results.items()
+        if payload.get("error")
+    }
     return {
         "as_of": str(as_of),
         "results": done_results,
         "pending": snap["pending"],
         "complete": snap["done"] and not snap["error"],
         "error": snap["error"],
+        "failed": failed,
         "started_at": snap["started_at_ms"],
     }
 
@@ -692,16 +719,29 @@ def run_all(request: Request, body: Optional[dict] = None):
         raise HTTPException(status_code=400, detail=str(e)) from e
 
     results: dict[str, dict] = {}
+    failed: dict[str, str] = {}
     for sid, result in engine_results.items():
+        # 用 getattr 兼容测试替身/旧版结果对象 (它们可能没有 error 字段)
+        err = getattr(result, "error", None)
+        if err:
+            # 策略自身失败 (如引用了不存在的指标列): 保留占位 + 错误原因,
+            # 其余策略的结果照常返回 —— 不能让一条坏策略毁掉整批。
+            failed[sid] = err
         safe_rows = _safe(asdict(result)).get("rows", [])
         results[sid] = {
             "total": result.total,
             "as_of": str(as_of),
             "rows": safe_rows,
         }
+        if err:
+            # 把错误一并写进结果: 缓存落盘后 /cached-summary 能读到, 前端可标红
+            results[sid]["error"] = err
 
     elapsed = (time.perf_counter() - t_total) * 1000
-    logger.info("run_all: total took %.1fms (%d strategies)", elapsed, len(all_ids))
+    logger.info(
+        "run_all: total took %.1fms (%d strategies, %d failed)",
+        elapsed, len(all_ids), len(failed),
+    )
 
     # 写入策略缓存 (供页面秒加载); 分钟周期结果不落盘 (日线语义缓存)
     if results and timeframe == "1d":
@@ -711,16 +751,23 @@ def run_all(request: Request, body: Optional[dict] = None):
             pass
 
     if body.get("summary_only"):
-        return {
+        summary_payload = {
             "as_of": str(as_of),
             "results": {
                 sid: {"total": result["total"], "as_of": result["as_of"]}
                 for sid, result in results.items()
             },
         }
+        if failed:
+            summary_payload["failed"] = failed
+        return summary_payload
 
     ext_values = _load_ext_value_maps(repo, body.get("ext_columns"))
-    return {"as_of": str(as_of), "results": _results_with_ext(results, ext_values)}
+    payload = {"as_of": str(as_of), "results": _results_with_ext(results, ext_values)}
+    if failed:
+        # 失败策略清单 (strategy_id → 错误摘要), 前端可据此提示"该策略已跳过"
+        payload["failed"] = failed
+    return payload
 
 
 @router.get("/limit-ladder")

@@ -122,6 +122,8 @@ export function Screener() {
   const [hitCounts, setHitCounts] = useState<Record<string, number>>({})
   // 各策略失效数 (今日曾命中 - 当前命中)
   const [expiredCounts, setExpiredCounts] = useState<Record<string, number>>({})
+  // 各策略本轮失败原因 (坏策略只跳过自己, 其余策略照常返回)
+  const [strategyErrors, setStrategyErrors] = useState<Record<string, string>>({})
   // 各策略显示上限 (null = 全部)
   const [strategyLimits, setStrategyLimits] = useState<Record<string, number | null>>({})
   // run_all 渐进式返回后仍在后台计算的策略 (startedAt 为后端时钟, 用于判断缓存新旧)
@@ -273,8 +275,13 @@ export function Screener() {
       ),
     onSuccess: (data) => {
       if (data.as_of) setAsOf(data.as_of)
+      // 单策略失败 (坏策略只跳过自己, 其余策略照常返回)
+      const failed = data.failed ?? {}
+      const failedIds = Object.keys(failed)
       const counts: Record<string, number> = {}
       for (const [id, item] of Object.entries(data.results)) {
+        // 失败的策略不计入命中数 (total=0 会被误读成"今天没命中")
+        if (failed[id]) continue
         counts[id] = item.total
       }
       setHitCounts(prev => ({ ...prev, ...counts }))
@@ -285,6 +292,22 @@ export function Screener() {
           : null,
       )
       if (data.error) toast(`策略计算失败：${data.error}`, 'error')
+      if (failedIds.length) {
+        const names = failedIds.map(id => strategyIdToName[id] ?? id)
+        toast(
+          `${failedIds.length} 个策略计算失败已跳过：${names.slice(0, 3).join('、')}${failedIds.length > 3 ? ' 等' : ''}`,
+          'error',
+        )
+      }
+      setStrategyErrors(prev => {
+        const next = { ...prev }
+        for (const id of failedIds) next[id] = failed[id]
+        // 本轮成功的策略清掉上一轮的失败标记
+        for (const id of Object.keys(data.results)) {
+          if (!failed[id]) delete next[id]
+        }
+        return next
+      })
       qc.invalidateQueries({ queryKey: ['screener-cached'] })
     },
   })
@@ -318,8 +341,16 @@ export function Screener() {
     if (!summaryQuery.data || !asOf) return
     const counts: Record<string, number> = {}
     const expired: Record<string, number> = {}
+    const errs: Record<string, string> = {}
+    const okIds: string[] = []
     for (const [id, r] of Object.entries(summaryQuery.data.results)) {
       if (r.as_of !== asOf) continue
+      if (r.error) {
+        // 渐进式后台补算失败的策略: 缓存里带 error, 卡片标红而不是显示 0 命中
+        errs[id] = r.error
+        continue
+      }
+      okIds.push(id)
       counts[id] = r.total
       const everCount = summaryQuery.data.today_ever_counts[id] ?? r.total
       const expiredCount = Math.max(everCount - r.total, 0)
@@ -327,6 +358,12 @@ export function Screener() {
     }
     setHitCounts(counts)
     setExpiredCounts(expired)
+    setStrategyErrors(prev => {
+      const next = { ...prev }
+      // 本轮成功的策略清掉失败标记
+      for (const id of okIds) delete next[id]
+      return { ...next, ...errs }
+    })
     // 渐进式: computed_at 晚于本轮起点的策略已算完, 从 pending 中移除;
     // 无 computed_at (监控实时叠加/旧缓存) 视为新鲜。容差吸收前后端时钟差。
     if (pendingRun) {
@@ -848,6 +885,7 @@ export function Screener() {
                   active={activeStrategy === s.id}
                   count={hitCounts[id]}
                   expiredCount={expiredCounts[id]}
+                  error={strategyErrors[id] ?? null}
                   loading={runAll.isPending}
                   computing={pendingRunIds.has(id)}
                   cardSize={cardSize}

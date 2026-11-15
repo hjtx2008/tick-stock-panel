@@ -16,6 +16,7 @@ from datetime import date
 
 import numpy as np
 import polars as pl
+import pytest
 
 from app.strategy.engine import StrategyDataContext, StrategyEngine
 
@@ -345,6 +346,50 @@ def test_composite_intersect_requires_min_confirm(tmp_path):
     # 只有 000001 同时被两个子策略命中
     symbols = {row["symbol"] for row in result.rows}
     assert symbols == {"000001.SZ"}
+
+
+def test_composite_child_failure_is_not_merged_as_empty(tmp_path):
+    """子策略失败时组合策略整体失败, 不能把失败占位当 0 命中参与合并。
+
+    run_all 会把失败子策略隔离成 total=0 的占位; 若合并器照单全收,
+    union 少一路候选、intersect/min_confirm 计票错误, 而组合结果看起来正常。
+    """
+    child_dir = tmp_path / "strategies" / "custom"
+    comp_dir = tmp_path / "strategies" / "composite"
+    child_dir.mkdir(parents=True)
+    comp_dir.mkdir(parents=True)
+    (child_dir / "child_a.py").write_text(_filter_strategy_code("child_a"), encoding="utf-8")
+    (child_dir / "child_boom.py").write_text(
+        _filter_strategy_code("child_boom", body='raise ValueError("injected child failure")'),
+        encoding="utf-8",
+    )
+    (comp_dir / "blend_with_boom.py").write_text(
+        _composite_code("blend_with_boom", [("child_a", 0.5), ("child_boom", 0.5)]),
+        encoding="utf-8",
+    )
+    engine = StrategyEngine(strategy_dirs=[child_dir, comp_dir])
+    context = StrategyDataContext(
+        asset_type="stock",
+        timeframe="1d",
+        as_of=date(2026, 1, 2),
+        current=_stock_panel(["000001.SZ", "600000.SH"], [10.0, 20.0]),
+    )
+    overrides = {"basic_filter": {"enabled": False}}
+
+    with pytest.raises(ValueError, match="child_boom"):
+        engine.run("blend_with_boom", context, overrides=overrides)
+
+    # 批量运行中组合策略自身被隔离为失败占位, 而非"正常的部分结果"
+    results = engine.run_all(
+        context,
+        overrides_map={"blend_with_boom": overrides, "child_a": overrides},
+        strategy_ids=["child_a", "blend_with_boom"],
+    )
+    assert results["child_a"].error is None
+    assert results["child_a"].total == 2
+    assert results["blend_with_boom"].error is not None
+    assert "injected child failure" in results["blend_with_boom"].error
+    assert results["blend_with_boom"].rows == []
 
 
 def test_composite_weighted_score_ranking(tmp_path):

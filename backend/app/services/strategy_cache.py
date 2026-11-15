@@ -139,7 +139,14 @@ def _write_cache_locked(
     old_ever_rows: dict[str, dict[str, dict]] = old.get("today_ever_rows", {}) if old else {}
 
     if old_as_of == as_of:
-        merged_results = {**(old.get("results") or {}), **results}
+        old_results = old.get("results") or {}
+        merged_results = {**old_results, **results}
+        # 失败占位 (total=0, rows=[], error) 不得覆盖同日已有的成功结果:
+        # 一次瞬时失败的重跑会把卡片命中数清零、明细丢失。保留上一份有效结果。
+        for sid, r in results.items():
+            prev = old_results.get(sid)
+            if r.get("error") and isinstance(prev, dict) and not prev.get("error"):
+                merged_results[sid] = prev
     else:
         merged_results = results
 

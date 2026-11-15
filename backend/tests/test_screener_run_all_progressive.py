@@ -105,7 +105,12 @@ def test_run_all_returns_fast_first_then_background_fills_cache(
     assert all(r.get("computed_at") for r in results.values())
 
     # 耗时已记录 → 下次按耗时升序 (快策略先算)
+    # 耗时在逐策略写缓存之后的收尾阶段才落盘, 缓存齐全时它可能还没写 → 轮询等待
+    deadline = time.time() + 8.0
     timings = strategy_run_queue.load_run_timings(tmp_path)
+    while set(timings) != {"fast_a", "fast_b", "slow_c"} and time.time() < deadline:
+        time.sleep(0.05)
+        timings = strategy_run_queue.load_run_timings(tmp_path)
     assert set(timings) == {"fast_a", "fast_b", "slow_c"}
     assert timings["slow_c"] > timings["fast_a"]
 
@@ -177,17 +182,55 @@ def test_run_all_same_key_piggybacks_running_execution(
     assert engine.executed.count("fast_a") == 1
 
 
+def test_run_all_strategy_error_is_isolated_not_whole_batch_500(
+    monkeypatch, tmp_path, fast_first_return
+):
+    """单条策略抛错 → 只跳过它自己, 其余策略照常返回 (2026-11-13 行为变更)。
+
+    原行为: 异常逃出 job() → handle.fail() → 整个渐进循环中断,
+    后面所有策略一个都不再执行, 且 HTTP 500 让前端拿不到任何结果。
+    """
+    class _BoomEngine(_FakeEngine):
+        def run_all(self, context, params_map=None, overrides_map=None, *, strategy_ids=None, parallel=True):
+            if "bad_a" in (strategy_ids or []):
+                raise ValueError("缺少列: volume")
+            return super().run_all(
+                context,
+                params_map=params_map,
+                overrides_map=overrides_map,
+                strategy_ids=strategy_ids,
+                parallel=parallel,
+            )
+
+    monkeypatch.setattr(screener_api, "ScreenerService", _FakeService)
+    resp = screener_api.run_all(
+        _request(tmp_path, _BoomEngine({"bad_a": 0.01, "good_b": 0.01})),
+        {
+            "as_of": AS_OF,
+            "strategy_ids": ["bad_a", "good_b"],
+            "asset_type": "stock",
+            "timeframe": "1d",
+            "summary_only": True,
+        },
+    )
+    # 不再 500 —— 坏策略被跳过, 好策略的结果照常返回
+    assert "volume" in resp["failed"]["bad_a"]
+    assert resp["results"]["good_b"]["total"] == 1
+
+
 def test_run_all_background_error_without_results_is_500(
     monkeypatch, tmp_path, fast_first_return
 ):
-    class _BoomEngine(_FakeEngine):
-        def run_all(self, context, params_map=None, overrides_map=None, *, strategy_ids=None, parallel=True):
+    """批次级失败 (装配上下文就炸了) → 仍然 500, 不返回空成功。"""
+
+    class _BoomService(_FakeService):
+        def build_strategy_context(self, *args, **kwargs):
             raise ValueError("缺少列: volume")
 
-    monkeypatch.setattr(screener_api, "ScreenerService", _FakeService)
+    monkeypatch.setattr(screener_api, "ScreenerService", _BoomService)
     with pytest.raises(HTTPException) as excinfo:
         screener_api.run_all(
-            _request(tmp_path, _BoomEngine({"bad_a": 0.01})),
+            _request(tmp_path, _FakeEngine({"bad_a": 0.01})),
             {
                 "as_of": AS_OF,
                 "strategy_ids": ["bad_a"],
