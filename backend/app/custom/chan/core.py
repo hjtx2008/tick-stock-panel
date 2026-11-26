@@ -65,7 +65,10 @@ class ChanParams:
     # ── 成笔条件 (§4.3) ───────────────────────────────────────────
     stroke_version: Literal["new", "old"] = "new"
     min_gap_bars: int = 1
-    min_k_count: int = 5
+    # 两极值之间的原始 K 跨度下限。4 = czsc 口径 (2026-11-26 由 2A 的 5 改为 4):
+    # czsc 只要求两端分型不共用 K 线 (strict_no_shared_kline, 合并 K 差 >= 3),
+    # 这本身就保证跨度 >= 4, 所以新笔下此项不再额外收紧。
+    min_k_count: int = 4
     strict_no_shared_kline: bool = True
 
     # ── 中枢构造 (§4.5) ───────────────────────────────────────────
@@ -781,25 +784,47 @@ def build_strokes(fractals: Sequence[Fractal], params: ChanParams) -> list[Strok
 
     规则:
     - 相邻笔必须异型 (顶→底 / 底→顶), 同型取更极端者;
-    - 成笔还要满足 ``_stroke_gap_ok`` 的间隔条件;
+    - 笔终点取起点之后**最极端**的反向分型 (czsc ``check_bi``: 向上笔取最高顶,
+      向下笔取最低底), 再用 ``_stroke_gap_ok`` 校验成笔条件; 最极端者不满足时
+      不退而求其次, 等待更极端的反向分型或起点被同型更极端者取代;
     - 笔的 ``k_count`` = 首尾极值之间跨越的原始 K 线根数 (交易日口径)。
     """
+
+    def more_extreme(a: Fractal, b: Fractal) -> bool:
+        return a.price > b.price if a.kind == "top" else a.price < b.price
+
     selected: list[Fractal] = []
+    # 起点之后迄今最极端的反向分型 (成笔候选)
+    pending: Fractal | None = None
     for f in fractals:
         if not selected:
             selected.append(f)
             continue
         last = selected[-1]
         if f.kind == last.kind:
-            # 同型分型: 取更极端的
-            if (f.kind == "top" and f.price > last.price) or (
-                f.kind == "bottom" and f.price < last.price
-            ):
+            # 同型分型: 取更极端的; 起点后移, 之前的候选作废
+            if more_extreme(f, last):
                 selected[-1] = f
+                pending = None
             continue
-        if _stroke_gap_ok(last, f, params):
-            selected.append(f)
-        # 间隔不够 → 跳过该分型, 等待后面的分型
+        # 反向分型: 必须越过起点 (向上笔顶高于起点底), 且比已有候选更极端才替换候选。
+        # 旧实现取「第一个满足间隔的反向分型」, 会跳过离起点太近的更高顶,
+        # 导致笔终点不是笔内极值 (如 000001.SZ 2025-12-31~2026-01-13)。
+        if not more_extreme(f, last):
+            continue
+        if pending is None or more_extreme(f, pending):
+            pending = f
+        if _stroke_gap_ok(last, pending, params):
+            selected.append(pending)
+            pending = None
+        elif len(selected) >= 2 and more_extreme(pending, selected[-2]):
+            # 候选越过了上一笔的起点 (如向上候选顶高于前一向下笔的起点顶) 却因
+            # 长度不足成不了笔: 上一笔被破坏, 删掉它, 让再前一笔延伸到候选。
+            # 否则后续行情会把这根更极端的 K 线包进反向笔内, 端点仍非极值。
+            # (czsc 用更短的 min_bi_len, 少见此情形; 这里配合 2A 的 5 根下限补上。)
+            selected.pop()
+            selected[-1] = pending
+            pending = None
 
     strokes: list[Stroke] = []
     for a, b in pairwise(selected):

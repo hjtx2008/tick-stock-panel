@@ -1129,6 +1129,84 @@ def test_stroke_rejects_mutually_containing_fractals() -> None:
     assert len(build_strokes([a, c], ChanParams())) == 1
 
 
+def _assert_stroke_endpoints_are_extremes(fractals: list[Fractal], strokes: list) -> None:
+    """笔内任何分型都不能越过笔的两个端点 (端点 = 笔内极值)。"""
+    for s in strokes:
+        top = max(s.start.price, s.end.price)
+        bot = min(s.start.price, s.end.price)
+        for f in fractals:
+            if s.start.bar_index < f.bar_index < s.end.bar_index:
+                assert bot <= f.price <= top, (
+                    f"{s.direction} 笔 {s.start.price}->{s.end.price} 内有分型 {f.kind} {f.price}"
+                )
+
+
+def test_stroke_end_is_most_extreme_fractal_not_first_valid_one() -> None:
+    """czsc check_bi: 向上笔终点取起点后的最高顶。
+
+    底 10 之后的顶 12 离起点太近 (两分型共用 K 线) 不能成笔; 旧实现会退而取后面
+    够远的顶 11, 画出一笔「10 → 11」而 12 在笔内。现在最高顶不够长就不成笔。
+    """
+    fxs = [
+        _fx("bottom", 10.0, 0),
+        _fx("top", 12.0, 2),
+        _fx("bottom", 10.5, 5),
+        _fx("top", 11.0, 8),
+        _fx("bottom", 9.0, 12),
+        _fx("top", 11.5, 18),
+    ]
+    strokes = build_strokes(fxs, ChanParams())
+    _assert_stroke_endpoints_are_extremes(fxs, strokes)
+    assert all(not (s.direction == "up" and s.end.price == 11.0) for s in strokes)
+
+
+def test_stroke_broken_by_candidate_beyond_previous_start_is_removed() -> None:
+    """向下笔 11.04 → 10.80 之后, 顶 11.20 越过了这笔的起点 11.04, 但离底 10.80
+    太近 (两分型共用 K 线) 成不了笔。旧实现画出「10.80 → 10.93」向上笔, 11.20
+    被包在笔内。现在向下笔 11.04 → 10.80 被破坏删除, 前一向上笔延伸到 11.20。
+    """
+    fxs = [
+        _fx("bottom", 10.69, 0),
+        _fx("top", 11.04, 6),
+        _fx("bottom", 10.80, 14),
+        _fx("top", 11.20, 16),
+        _fx("bottom", 10.82, 20),
+        _fx("top", 10.93, 21),
+        _fx("bottom", 10.10, 30),
+    ]
+    strokes = build_strokes(fxs, ChanParams())
+    _assert_stroke_endpoints_are_extremes(fxs, strokes)
+    assert [(s.direction, s.start.price, s.end.price) for s in strokes] == [
+        ("up", 10.69, 11.20),
+        ("down", 11.20, 10.10),
+    ]
+
+
+def test_default_min_stroke_length_matches_czsc() -> None:
+    """2026-11-26 起长度下限对齐 czsc: 两端分型不共用 K 线即可成笔 (跨度 4 根)。
+
+    真实样本 000678.SZ: 11-09 底 17.40 → 11-12 顶 23.31 只跨 4 根原始 K。
+    旧下限 5 根时这笔不成立, 11-03 顶 / 11-09 底被并进 9.90 → 23.31 的长笔。
+    """
+    fxs = [
+        _fx("bottom", 9.90, 0),    # 10-15
+        _fx("top", 20.44, 13),     # 11-03
+        _fx("bottom", 17.40, 17),  # 11-09
+        _fx("top", 23.31, 20),     # 11-12
+        _fx("bottom", 14.59, 25),  # 11-19
+    ]
+    strokes = build_strokes(fxs, ChanParams())
+    _assert_stroke_endpoints_are_extremes(fxs, strokes)
+    assert [(s.direction, s.start.price, s.end.price) for s in strokes] == [
+        ("up", 9.90, 20.44),
+        ("down", 20.44, 17.40),
+        ("up", 17.40, 23.31),
+        ("down", 23.31, 14.59),
+    ]
+    # 旧下限 5 根: 17.40 → 23.31 成不了笔, 中间这段回调被吞掉
+    assert len(build_strokes(fxs, ChanParams(min_k_count=5))) == 2
+
+
 def test_pivots_partition_like_czsc_get_zs_seq() -> None:
     """3B: 顺序切分; 某笔完全离开区间时以它开新中枢, ZG/ZD 取中枢前 3 笔。"""
     from app.custom.chan.core import build_pivots
